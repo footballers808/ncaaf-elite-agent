@@ -1,2 +1,10 @@
 timezone: America/Phoenix
-email_subject_prefix: "[NCAAF Agent] Health Check"
+email_subject_prefix: "[NCAAF Agent] Predictions"
+
+# Model knobs
+hfa_points: 2.0
+power_scale: 0.035
+sigma_points: 13.0
+min_total_floor: 34.0
+max_total_cap: 76.0
+
