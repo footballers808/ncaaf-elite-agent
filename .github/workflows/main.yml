@@ -1,0 +1,38 @@
+name: Daily NCAAF Agent
+on:
+  workflow_dispatch: {}   # lets you run manually
+  schedule:
+    - cron: '0 14 * * *'  # runs daily at 7 AM Phoenix
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - name: Validate secrets
+        run: |
+          python - << 'PY'
+          import os, sys
+          required = ['SMTP_SERVER','SMTP_PORT','EMAIL_USER','EMAIL_PASS','EMAIL_TO']
+          missing = [k for k in required if not os.environ.get(k)]
+          if missing:
+            print("Missing secrets:", missing); sys.exit(1)
+          print("✅ Secrets OK")
+          PY
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT:   ${{ secrets.SMTP_PORT }}
+          EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+      - run: pip install -r requirements.txt
+      - name: Run health check
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT:   ${{ secrets.SMTP_PORT }}
+          EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+        run: python main.py
