@@ -28,11 +28,12 @@ jobs:
           EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
           EMAIL_TO:    ${{ secrets.EMAIL_TO }}
       - run: pip install -r requirements.txt
-      - name: Run health check
-        env:
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT:   ${{ secrets.SMTP_PORT }}
-          EMAIL_USER:  ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO:    ${{ secrets.EMAIL_TO }}
-        run: python main.py
+     - name: Run predictor
+  env:
+    SMTP_SERVER:  ${{ secrets.SMTP_SERVER }}
+    SMTP_PORT:    ${{ secrets.SMTP_PORT }}
+    EMAIL_USER:   ${{ secrets.EMAIL_USER }}
+    EMAIL_PASS:   ${{ secrets.EMAIL_PASS }}
+    EMAIL_TO:     ${{ secrets.EMAIL_TO }}
+    CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}   # ← add this line
+  run: python main.py
