@@ -3,7 +3,7 @@ name: ncaaf-elite-agent
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 12 * * *"   # 12:15 UTC daily (≈ 05:15 America/Phoenix)
+    - cron: "15 12 * * *"   # 12:15 UTC daily
 
 jobs:
   run:
@@ -34,7 +34,10 @@ jobs:
 
       - name: Run NCAAF Elite Agent
         run: |
-          python -m src.main
+          # Ensure repo root is importable (so 'import main' works)
+          export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
+          # Prefer the package entrypoint that delegates to root main.py
+          python -m src.main || python main.py
 
       - name: Upload outputs & history
         if: always()
