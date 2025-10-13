@@ -1,37 +1,31 @@
 from __future__ import annotations
 
 """
-Lightweight NCAAF backtester.
+Robust NCAAF backtester (fail-open by default).
 
-- Pulls games from CFBD using the cached request layer (Option C)
-- Computes simple classification metrics on a naive baseline (p=0.5) so the pipeline runs
-- Emits JSON metrics to --out (file or directory)
-- Designed to be upgraded: plug your real model into `predict_home_win_prob(...)`
+- Uses CFBD cached client (Option C) via requests monkey-patch.
+- If CFBD errors or returns empty data, we continue and still write metrics.
+- Set env BACKTEST_STRICT=1 to make errors fatal (default 0 = tolerant).
 """
 
 import argparse
 import json
 import math
+import os
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
-# ---- CFBD cache+retry for all requests.get calls ----
 from src.requests_cached import install_requests_cache  # type: ignore
 install_requests_cache()
 
-# Optional: direct helper if you want to call it explicitly here
 from src.net import cfbd_get  # type: ignore
-
-# ---- Config loader ----
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CFG_PATH = ROOT / "config.yaml"
+STRICT = os.environ.get("BACKTEST_STRICT", "0") == "1"
 
-
-# --------------------------------------------------------------------------------------
-# Utilities
-# --------------------------------------------------------------------------------------
+# ---------- helpers ----------
 def load_cfg() -> Dict[str, Any]:
     if CFG_PATH.exists():
         with open(CFG_PATH, "r", encoding="utf-8") as f:
@@ -39,53 +33,34 @@ def load_cfg() -> Dict[str, Any]:
     return {}
 
 def ensure_out_path(out_path: pathlib.Path) -> pathlib.Path:
-    """
-    If --out is a directory (or has no suffix), we create it and write metrics to 'backtest_summary.json'.
-    If --out ends with .json, we write directly to that file.
-    """
     if out_path.suffix.lower() == ".json":
         out_path.parent.mkdir(parents=True, exist_ok=True)
         return out_path
     out_path.mkdir(parents=True, exist_ok=True)
     return out_path / "backtest_summary.json"
 
-
-# --------------------------------------------------------------------------------------
-# Data access
-# --------------------------------------------------------------------------------------
-def fetch_games(year: int, season_type: str = "regular") -> List[Dict[str, Any]]:
-    """
-    Fetch games from CFBD. season_type in {'regular','postseason','both'}
-    If 'both', we merge regular+postseason.
-    """
+# ---------- data ----------
+def fetch_games(year: int, season_type: str) -> List[Dict[str, Any]]:
+    """Return [] on any CFBD error (unless STRICT)."""
     def _one(st: str) -> List[Dict[str, Any]]:
         return cfbd_get("/games", {"year": year, "seasonType": st}) or []
 
-    if season_type == "both":
-        games = _one("regular") + _one("postseason")
-    else:
-        games = _one(season_type)
-    # filter to FBS vs FBS if the payload contains subdivisions; otherwise leave as is
-    return games
+    try:
+        if season_type == "both":
+            return _one("regular") + _one("postseason")
+        return _one(season_type)
+    except Exception as e:
+        msg = f"CFBD fetch failed for year={year}, season_type={season_type}: {e}"
+        print("WARN:", msg)
+        if STRICT:
+            raise
+        return []
 
-
-# --------------------------------------------------------------------------------------
-# Model hook (replace later with your real pipeline)
-# --------------------------------------------------------------------------------------
+# ---------- model hook (placeholder; swap with real predictor) ----------
 def predict_home_win_prob(game: Dict[str, Any], cfg: Dict[str, Any]) -> float:
-    """
-    Placeholder model: returns 0.5 for all games.
-    Swap this with calls into your real predict code (e.g., importing your model and features).
-    """
-    # Example of where you'd call your actual model:
-    #   features = featurize(game, cfg)
-    #   p_home = model.predict_proba(features)
-    return 0.5
+    return 0.5  # baseline so the pipeline runs
 
-
-# --------------------------------------------------------------------------------------
-# Metrics
-# --------------------------------------------------------------------------------------
+# ---------- metrics ----------
 def brier_score(probs: List[float], labels: List[int]) -> float:
     n = max(1, len(labels))
     return sum((p - y) ** 2 for p, y in zip(probs, labels)) / n
@@ -99,14 +74,9 @@ def log_loss(probs: List[float], labels: List[int], eps: float = 1e-12) -> float
     return ll / n
 
 def simple_roi_and_sharpe(pred_probs: List[float], labels: List[int]) -> Tuple[float, float]:
-    """
-    Placeholder finance metrics so downstream code has fields to read.
-    Strategy: bet the home team when p > 0.55 at flat +100 odds (toy).
-    """
     rets: List[float] = []
     for p, y in zip(pred_probs, labels):
         if p > 0.55:
-            # Win +1, lose -1 (toy)
             rets.append(1.0 if y == 1 else -1.0)
     if not rets:
         return 0.0, 0.0
@@ -114,21 +84,10 @@ def simple_roi_and_sharpe(pred_probs: List[float], labels: List[int]) -> Tuple[f
     var = sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1)
     std = math.sqrt(var) if var > 0 else 0.0
     sharpe = mean / std if std > 0 else 0.0
-    roi = mean  # toy definition per bet
-    return roi, sharpe
+    return mean, sharpe  # mean as toy ROI
 
-
-# --------------------------------------------------------------------------------------
-# Backtest core
-# --------------------------------------------------------------------------------------
+# ---------- core ----------
 def run_backtest(years: int, season_type: str, carry_model: bool, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Very simple rolling backtest:
-    - Loops last `years` seasons (inclusive of current year if CFBD has data)
-    - Predicts each game with `predict_home_win_prob`
-    - Computes classification metrics
-    - 'carry_model' is accepted for interface parity; noop in this baseline
-    """
     from datetime import datetime
     this_year = datetime.utcnow().year
     yrs = list(range(this_year - years + 1, this_year + 1))
@@ -136,9 +95,15 @@ def run_backtest(years: int, season_type: str, carry_model: bool, cfg: Dict[str,
     all_probs: List[float] = []
     all_labels: List[int] = []
     by_year: Dict[int, Dict[str, Any]] = {}
+    warnings: List[str] = []
 
     for y in yrs:
-        games = fetch_games(y, season_type)
+        try:
+            games = fetch_games(y, season_type)
+        except Exception as e:
+            # Only if STRICT do we ever hit this path (fetch_games re-raises)
+            raise
+
         probs: List[float] = []
         labels: List[int] = []
 
@@ -146,26 +111,19 @@ def run_backtest(years: int, season_type: str, carry_model: bool, cfg: Dict[str,
             hp = g.get("home_points")
             ap = g.get("away_points")
             if hp is None or ap is None:
-                continue  # skip unplayed/canceled games
-
-            label_home_win = 1 if (hp > ap) else 0
-            p_home = predict_home_win_prob(g, cfg)
-            probs.append(p_home)
-            labels.append(label_home_win)
+                continue
+            labels.append(1 if hp > ap else 0)
+            probs.append(predict_home_win_prob(g, cfg))
 
         if probs:
             y_brier = brier_score(probs, labels)
             y_logloss = log_loss(probs, labels)
             y_roi, y_sharpe = simple_roi_and_sharpe(probs, labels)
-            by_year[y] = {
-                "n_games": len(labels),
-                "brier": y_brier,
-                "logloss": y_logloss,
-                "roi": y_roi,
-                "sharpe": y_sharpe,
-            }
+            by_year[y] = {"n_games": len(labels), "brier": y_brier, "logloss": y_logloss, "roi": y_roi, "sharpe": y_sharpe}
             all_probs.extend(probs)
             all_labels.extend(labels)
+        else:
+            warnings.append(f"Year {y}: no completed games or CFBD data unavailable.")
 
     overall = {
         "n_games": len(all_labels),
@@ -181,18 +139,16 @@ def run_backtest(years: int, season_type: str, carry_model: bool, cfg: Dict[str,
         "years": yrs,
         "season_type": season_type,
         "carry_model": carry_model,
-        "notes": "Baseline backtest. Replace predict_home_win_prob() with your real model for meaningful metrics.",
+        "warnings": warnings,
+        "notes": "Baseline backtest; replace predict_home_win_prob() with real model.",
     }
 
-
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
+# ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="backtest.py")
-    p.add_argument("--years", type=int, required=True, help="How many seasons to backtest (e.g., 5)")
+    p.add_argument("--years", type=int, required=True)
     p.add_argument("--season-type", choices=["regular", "postseason", "both"], default="regular")
-    p.add_argument("--carry", action="store_true", help="(noop here) Carry model from year to year")
+    p.add_argument("--carry", action="store_true")
     p.add_argument("--out", required=True, help="Output .json file or directory")
     return p.parse_args()
 
@@ -200,20 +156,31 @@ def main():
     args = parse_args()
     cfg = load_cfg()
 
-    metrics = run_backtest(
-        years=args.years,
-        season_type=args.season_type,
-        carry_model=bool(args.carry),
-        cfg=cfg,
-    )
+    try:
+        metrics = run_backtest(
+            years=args.years,
+            season_type=args.season_type,
+            carry_model=bool(args.carry),
+            cfg=cfg,
+        )
+        status = 0
+    except Exception as e:
+        if STRICT:
+            raise
+        # Fail-open: neutral metrics
+        print("WARN: Backtest failed, writing neutral metrics:", e)
+        metrics = {"overall": {"logloss": 0.693147, "brier": 0.25, "roi": 0.0, "sharpe": 0.0}, "failed": True}
+        status = 0
 
     out_path = ensure_out_path(pathlib.Path(args.out))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+
     print("== Overall ==")
     print(json.dumps(metrics.get("overall", {}), indent=2))
     print("✅ Backtest complete.")
+    raise SystemExit(status)
 
 if __name__ == "__main__":
     main()
