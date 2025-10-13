@@ -1,49 +1,206 @@
-name: ncaaf-elite-agent
+from __future__ import annotations
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
-on:
-  workflow_dispatch: {}
-  schedule:
-    - cron: "15 12 * * *"   # 12:15 UTC daily (05:15 America/Phoenix during MST)
+# === Core pipeline (unchanged from your previous flow) =========================
+from .model import train_model, predict_games, save_model, load_model
+from .labeler import label_latest_results
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+# === Optional reporting imports (guarded) =====================================
+try:
+    from .metrics import classification_metrics, regression_metrics
+    HAVE_METRICS = True
+except Exception:
+    HAVE_METRICS = False
 
-    env:
-      CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-      SMTP_HOST:     ${{ secrets.SMTP_HOST }}
-      SMTP_PORT:     ${{ secrets.SMTP_PORT }}
-      SMTP_USER:     ${{ secrets.SMTP_USER }}
-      SMTP_PASS:     ${{ secrets.SMTP_PASS }}
-      SMTP_FROM:     ${{ secrets.SMTP_FROM }}
+try:
+    from .reporter import render_html, to_csv_bytes
+    HAVE_REPORTER = True
+except Exception:
+    HAVE_REPORTER = False
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+try:
+    from .mailer import send_email_html
+    HAVE_MAILER = True
+except Exception:
+    HAVE_MAILER = False
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# === Config loader ============================================================
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+def load_config(path: str = "config.yaml") -> Dict[str, Any]:
+    """
+    Loads YAML config if available; if not, returns empty dict so prior behavior
+    (default args in your own functions) still works.
+    """
+    if yaml is None:
+        return {}
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return (yaml.safe_load(f) or {})
 
-      - name: Run NCAAF Elite Agent
-        run: |
-          python -m src.main
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
-      - name: Upload outputs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-outputs
-          path: |
-            outputs/**/*.csv
-            outputs/**/*.json
-            outputs/**/*.parquet
-            outputs/**/*.txt
-          if-no-files-found: ignore
+def _write_csv(path: str, rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    import csv
+    # stable header across runs
+    headers = sorted({k for r in rows for k in r.keys()})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+def _maybe_send_report(cfg: Dict[str, Any], ts_tag: str, predictions: List[Dict[str, Any]], labeled_rows: List[Dict[str, Any]]):
+    """
+    Backward-safe: If reporting is disabled/missing, or any module/env is missing,
+    we no-op and keep prior behavior.
+    """
+    report_cfg = (cfg.get("report") or {})
+    if not report_cfg.get("enabled", False):
+        print("ℹ️ Reporting disabled in config.")
+        return
+
+    # Ensure optional modules are available
+    if not (HAVE_METRICS and HAVE_REPORTER and HAVE_MAILER):
+        print("ℹ️ Reporting modules not fully available; skipping email.")
+        return
+
+    # Require a minimum volume of labeled data
+    n_labeled = len([r for r in labeled_rows if r.get("y_true") is not None])
+    if n_labeled < int(report_cfg.get("min_games_for_report", 5)):
+        print(f"ℹ️ Not enough labeled games ({n_labeled}) to send report.")
+        return
+
+    # Build classification metrics (robust to missing keys)
+    y_true_cls = []
+    y_prob_cls = []
+    for r in labeled_rows:
+        yt = r.get("y_true")
+        yp = r.get("y_prob")
+        if yt is None or yp is None:
+            continue
+        try:
+            y_true_cls.append(int(yt))
+            y_prob_cls.append(float(yp))
+        except Exception:
+            pass
+
+    cls_m = classification_metrics(y_true_cls, y_prob_cls, threshold=0.5, bins=10) if y_true_cls else None
+
+    # Build regression metrics for spread/total if those columns exist
+    def collect_pair(rows, true_key, pred_key):
+        t, p = [], []
+        for rr in rows:
+            if rr.get(true_key) is None or rr.get(pred_key) is None:
+                continue
+            try:
+                t.append(float(rr[true_key]))
+                p.append(float(rr[pred_key]))
+            except Exception:
+                continue
+        return t, p
+
+    spread_t, spread_p = collect_pair(labeled_rows, "spread_true", "spread_pred")
+    total_t,  total_p  = collect_pair(labeled_rows, "total_true", "total_pred")
+
+    reg_spread = regression_metrics(spread_t, spread_p) if spread_t else None
+    reg_total  = regression_metrics(total_t,  total_p)  if total_t  else None
+
+    # Top edges table from predictions if present (robust to missing keys)
+    top_k = int(report_cfg.get("top_edges_in_email", 10))
+    edge_rows: List[Dict[str, Any]] = []
+    for r in predictions or []:
+        ev = r.get("edge_value")
+        et = r.get("edge_type")
+        if ev is None or et is None:
+            continue
+        try:
+            abs_edge = abs(float(ev))
+        except Exception:
+            continue
+        matchup = r.get("matchup") or f"{r.get('away_team','?')} @ {r.get('home_team','?')}"
+        edge_rows.append({
+            "matchup": matchup,
+            "market_text": r.get("market_text", ""),
+            "model_text":  r.get("model_text", ""),
+            "edge_text":   f"{float(ev):+.2f}",
+            "edge_type":   et,
+            "edge_abs":    abs_edge,
+        })
+    edge_rows.sort(key=lambda x: x["edge_abs"], reverse=True)
+    top_edges = edge_rows[:top_k] if edge_rows else None
+
+    subject_prefix = report_cfg.get("subject_prefix", "[NCAAF Elite Agent]")
+    subject = f"{subject_prefix} Run {ts_tag} — {n_labeled} labeled games"
+    run_title = f"NCAAF Elite Agent — Run {ts_tag}"
+
+    html = render_html(
+        run_title=run_title,
+        cls_metrics=cls_m,
+        reg_metrics_spread=reg_spread,
+        reg_metrics_total=reg_total,
+        top_edges_table=top_edges
+    )
+
+    # Attachments (optional)
+    attachments = []
+    if report_cfg.get("attach_predictions_csv", True) and predictions:
+        fields = sorted({k for r in predictions for k in r.keys()})
+        attachments.append((f"predictions_{ts_tag}.csv", to_csv_bytes(predictions, fields), "text/csv"))
+    if report_cfg.get("attach_edges_csv", True) and edge_rows:
+        fields = ["matchup","market_text","model_text","edge_type","edge_text","edge_abs"]
+        attachments.append((f"edges_{ts_tag}.csv", to_csv_bytes(edge_rows, fields), "text/csv"))
+
+    to = report_cfg.get("to") or []
+    cc = report_cfg.get("cc") or []
+    bcc = report_cfg.get("bcc") or []
+    if not to:
+        print("⚠️ report.to is empty; skipping email send.")
+        return
+
+    # Send email (mailer already uses env vars and will raise if not set)
+    try:
+        send_email_html(subject, html, to=to, cc=cc, bcc=bcc, attachments=attachments)
+        print(f"✅ Sent report email to {to}")
+    except Exception as e:
+        print(f"⚠️ Email send failed: {e}")
+
+def run() -> int:
+    cfg = load_config()
+    out_dir = cfg.get("output_dir", "outputs")
+    ensure_dir(out_dir)
+
+    # --- PREDICT (unchanged) ---
+    predictions = predict_games(cfg)  # ← your existing function
+
+    # --- LABEL (unchanged) ---
+    labeled_rows = label_latest_results(cfg, predictions)  # ← your existing function
+
+    # --- LEARN (unchanged) ---
+    model = load_model(cfg)                      # ← existing
+    model = train_model(cfg, model, labeled_rows)  # ← existing
+    save_model(cfg, model)                       # ← existing
+
+    # --- Persist CSVs exactly like before (adds timestamps) ---
+    ts_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if predictions:
+        _write_csv(os.path.join(out_dir, f"predictions_{ts_tag}.csv"), predictions)
+    if labeled_rows:
+        _write_csv(os.path.join(out_dir, f"labels_{ts_tag}.csv"), labeled_rows)
+
+    # --- NEW: Optional reporting; no-ops if disabled/missing ---
+    _maybe_send_report(cfg, ts_tag, predictions, labeled_rows)
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(run())
