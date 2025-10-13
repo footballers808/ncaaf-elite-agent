@@ -37,6 +37,23 @@ score_split_w_pace:    0.10
 score_split_gain:      0.03   # ↑ makes the split more extreme; ↓ makes it closer to 50/50
 
 learn:
+  schedule: "weekly"          # informational, used by your runner
+  min_labels: 50              # wait until at least this many fresh labels before fitting
+  drift_check:
+    enabled: true
+    metric: "psi"             # or "jsd"
+    threshold: 0.2
+  calibration:
+    method: "isotonic"
+    refit_each_learn: true
+
+staking:
+  method: "kelly_fractional"
+  kelly_fraction: 0.25
+  unit_cap: 1.0               # at most 1u per play (risk control)
+
+
+learn:
   enabled: true
   k_factor: 0.25        # how fast powers move per game (0.15–0.35 is typical)
   margin_cap: 24        # cap on point margin used for learning
