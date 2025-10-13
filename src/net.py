@@ -12,14 +12,15 @@ def _headers() -> Dict[str,str]:
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 def _key(url: str, params: Optional[Dict[str, Any]]) -> pathlib.Path:
-    base = url + "?" + "&".join(f"{k}={params[k]}" for k in sorted(params or {}))
+    q = "&".join(f"{k}={params[k]}" for k in sorted(params or {}))
+    base = f"{url}?{q}" if q else url
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()
     return CACHE_DIR / f"{h}.json"
 
 def cfbd_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 5) -> Any:
     """
-    GET wrapper with on-disk cache and backoff.
-    path: '/teams/fbs' or full 'https://api.collegefootballdata.com/teams/fbs'
+    Cached+retry GET for CFBD.
+    path may be '/teams/fbs' or a full 'https://api.collegefootballdata.com/teams/fbs'
     """
     url = path if path.startswith("http") else f"{CFBD}{path}"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,4 +43,3 @@ def cfbd_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
             time.sleep(sleep_s)
             continue
         r.raise_for_status()
-
