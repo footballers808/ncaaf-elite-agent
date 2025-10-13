@@ -12,6 +12,23 @@ HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 STORE_DIR = "store"
 os.makedirs(STORE_DIR, exist_ok=True)
 
+STORE_DIR = "store"
+os.makedirs(STORE_DIR, exist_ok=True)  # make sure it exists
+
+def main(year: Optional[int] = None, week: Optional[int] = None):
+    if year is None:
+        year = int(time.strftime("%Y"))
+    games = fetch_completed_games(year, week)
+    labels = build_labels(games)
+    if labels.empty:
+        print("⚠️ No completed games with scores found — skipping label save.")
+        # still write an empty placeholder to avoid FileNotFoundError later
+        pd.DataFrame().to_parquet(os.path.join(STORE_DIR, "labels.parquet"))
+        return
+    path = os.path.join(STORE_DIR, "labels.parquet")
+    labels.to_parquet(path, index=False)
+    print(f"✅ Wrote labels: {path} (rows={len(labels)})")
+
 def _get(path: str, params: Optional[Dict[str, Any]] = None):
     url = f"{CFBD}{path}"
     r = requests.get(url, params=params or {}, headers=HEADERS, timeout=45)
