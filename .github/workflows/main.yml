@@ -1,62 +1,60 @@
 name: Predict & Email
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 14 * * 5"   # adjust to your preferred UTC schedule
+    - cron: '30 12 * * *'   # daily 12:30 UTC (adjust if you want)
+  workflow_dispatch:
 
 jobs:
   predict:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      # Optional: verify required secrets exist (bash, not Python here-doc)
-      - name: Verify required secrets
-        shell: bash
-        run: |
-          missing=()
-          for k in SMTP_SERVER SMTP_PORT EMAIL_USER EMAIL_PASS EMAIL_TO CFBD_API_KEY; do
-            if [[ -z "${!k}" ]]; then missing+=("$k"); fi
-          done
-          if (( ${#missing[@]} )); then
-            echo "Missing secrets: ${missing[*]}"
-            exit 1
-          fi
-          echo "✅ Secrets OK"
-        env:
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT:   ${{ secrets.SMTP_PORT }}
-          EMAIL_USER:  ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO:    ${{ secrets.EMAIL_TO }}
-          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          python-version: '3.11'
 
       - name: Install deps
         run: pip install -r requirements.txt
 
       - name: Run predictor
         env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
           SMTP_SERVER:  ${{ secrets.SMTP_SERVER }}
           SMTP_PORT:    ${{ secrets.SMTP_PORT }}
           EMAIL_USER:   ${{ secrets.EMAIL_USER }}
           EMAIL_PASS:   ${{ secrets.EMAIL_PASS }}
           EMAIL_TO:     ${{ secrets.EMAIL_TO }}
-          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}   # must exist in repo secrets
         run: python main.py
 
-      - name: Upload predictions artifact
+      # If your code wrote predictions.csv to ./output/, copy it up one level
+      - name: Normalize predictions.csv location (optional)
+        run: |
+          if [ ! -f "predictions.csv" ] && [ -f "output/predictions.csv" ]; then
+            cp output/predictions.csv predictions.csv
+          fi
+          echo "Listing files for sanity:"
+          ls -la
+          echo "Listing output/:"
+          ls -la output || true
+
+      - name: Build edges CSV (standardize predictions)
+        run: python -m src.make_edges
+
+      - name: Generate exact-score probabilities
+        run: python -m src.exact_score
+
+      - name: Upload prediction artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: predictions
-          path: predictions.csv
+          name: predictions_bundle
+          path: |
+            predictions.csv
+            output/predictions.csv
+            output/edges_*.csv
+            output/exact_scores.csv
           if-no-files-found: ignore
-
