@@ -1,116 +1,176 @@
 name: NCAAF Elite Agent
 
 on:
-  schedule:
-    - cron: "15 12 * * *"   # daily run (UTC) -> adjust if you want
   workflow_dispatch:
     inputs:
       mode:
-        description: "Choose what to run"
+        description: "Mode to run"
+        required: true
+        default: "predict"
         type: choice
-        options: [run, backtest, tune]
-        default: run
-      years:
-        description: "Years (for backtest/tune). Example: 2022,2023"
+        options: [predict, label, learn, report, backtest, tune]
+      week:
+        description: "ISO week (yyyy-ww) or 'auto'"
         required: false
-        default: ""
-      season_type:
-        description: "Season type (for backtest/tune)"
+        default: "auto"
+      commit_best:
+        description: "If true, PR the merged tuned config"
+        required: false
+        default: "false"
         type: choice
-        options: [regular, postseason, both]
-        default: regular
+        options: ["false","true"]
+  schedule:
+    # Weekly learning/report every Monday 6:00 AM America/Phoenix
+    - cron: "0 13 * * 1"
 
 permissions:
-  contents: read
+  contents: write
+  actions: read
+
+concurrency:
+  group: ncaaf-elite-agent-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  agent:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     env:
+      PYTHONDONTWRITEBYTECODE: "1"
       CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-      SMTP_HOST: ${{ secrets.SMTP_HOST }}
-      SMTP_PORT: ${{ secrets.SMTP_PORT }}
-      SMTP_USER: ${{ secrets.SMTP_USER }}
-      SMTP_PASS: ${{ secrets.SMTP_PASS }}
-      SMTP_FROM: ${{ secrets.SMTP_FROM }}
+      SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+      SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+      SMTP_USER:     ${{ secrets.SMTP_USER }}
+      SMTP_PASS:     ${{ secrets.SMTP_PASS }}
+      FROM_ADDR:     ${{ secrets.FROM_ADDR }}
+      TO_ADDRS:      ${{ secrets.TO_ADDRS }}     # comma-separated
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }} # optional
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install -U pip
           pip install -r requirements.txt
 
-      # =======================
-      # MODE: run (default)
-      # =======================
-      - name: Run NCAAF Elite Agent
-        if: ${{ inputs.mode == 'run' || github.event_name == 'schedule' || github.event_name == 'push' }}
-        run: |
-          export PYTHONPATH="${GITHUB_WORKSPACE}:$PYTHONPATH"
-          python -m src.main || python main.py
-
-      - name: Upload outputs & history
-        if: always() && (inputs.mode == 'run' || github.event_name == 'schedule' || github.event_name == 'push')
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-outputs
-          path: |
-            outputs/**/*.csv
-            outputs/**/*.json
-            outputs/**/*.parquet
-            outputs/**/*.txt
-            history/**/*.csv
-            store/**/*.parquet
-          if-no-files-found: ignore
-
-      # =======================
-      # MODE: backtest
-      # =======================
-      - name: Run backtest
-        if: ${{ inputs.mode == 'backtest' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          YEARS="${{ inputs.years }}"
-          if [ -z "$YEARS" ]; then YEARS="2023,2024"; fi
-          python -m src.backtest --years "$YEARS" --season-type "${{ inputs.season_type }}" --out backtest_out
-
-      - name: Upload backtest results
-        if: ${{ inputs.mode == 'backtest' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-results
-          path: backtest_out/
-          if-no-files-found: error
-
-      # =======================
-      # MODE: tune (automatic hyperparameter sweep)
-      # =======================
-      - name: Run tuner sweep
-        if: ${{ inputs.mode == 'tune' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Optional: pass specific years to focus the sweep
-          YEARS="${{ inputs.years }}"
-          if [ -n "$YEARS" ]; then
-            # many users just run the default which is hardcoded in tune_config.py
-            echo "Using years: $YEARS (note: tune_config.py example ignores CLI; edit file to wire through if desired)"
-          fi
-          python -m src.tune_config
-
-      - name: Upload tuning results
-        if: ${{ inputs.mode == 'tune' }}
-        uses: actions/upload-artifact@v4
+      - name: Restore tuned config (if exists)
+        uses: actions/download-artifact@v4
         with:
           name: tuning-results
-          path: tuning_out/
-          if-no-files-found: error
+          path: tuning-results
+        continue-on-error: true
+
+      - name: Apply tuned config (if present) + validate
+        if: ${{ inputs.mode != 'tune' }}
+        run: |
+          if [ -f tuning-results/best_config.yaml ]; then
+            echo "Found tuning-results/best_config.yaml"
+            python tools/apply_best_config.py
+            cp config.merged.yaml config.yaml
+          else
+            echo "No tuning best_config.yaml found; proceeding with current config.yaml"
+          fi
+          python tools/validate_config.py
+
+      # ---- Modes ----
+      - name: Predict
+        if: ${{ inputs.mode == 'predict' }}
+        run: |
+          python -m src.predict --week "${{ inputs.week }}" --out artifacts/predictions.csv
+          python -m src.odds   --week "${{ inputs.week }}" --out artifacts/market_lines.csv
+          python -m src.edges  --pred artifacts/predictions.csv --lines artifacts/market_lines.csv --out artifacts/edges.csv
+          python -m src.report --week "${{ inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
+
+      - name: Label
+        if: ${{ inputs.mode == 'label' }}
+        run: |
+          python -m src.label --week "${{ inputs.week }}" --out artifacts/labels.csv
+
+      - name: Learn
+        if: ${{ inputs.mode == 'learn' }}
+        run: |
+          python -m src.learn --labels artifacts/labels.csv --save artifacts/model.bin
+          python -m src.eval  --report artifacts/learn-eval.json --calibration artifacts/calibration.png
+
+      - name: Report
+        if: ${{ inputs.mode == 'report' }}
+        run: |
+          python -m src.report --week "${{ inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
+
+      - name: Backtest
+        if: ${{ inputs.mode == 'backtest' }}
+        run: |
+          python -m src.backtest --years 5 --cv time --out artifacts/backtest.json
+          python -m src.tune --mode verify-best --in tuning-results/best_config.yaml --out artifacts/tune-verify.json
+
+      - name: Tune
+        if: ${{ inputs.mode == 'tune' }}
+        run: |
+          python -m src.tune --search bayes --iters 60 --out tuning-results
+          echo "Done."
+
+      # ---- Artifacts ----
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-artifacts
+          path: |
+            artifacts/**
+            tuning-results/best_config.yaml
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ---- Optional: create PR with merged tuned config ----
+      - name: Commit merged tuned config to branch
+        if: ${{ inputs.commit_best == 'true' && inputs.mode != 'tune' && hashFiles('config.merged.yaml') != '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BR="auto/best-config-${{ github.run_id }}"
+          git checkout -b "$BR"
+          cp config.merged.yaml config.yaml
+          git add config.yaml
+          git commit -m "chore: apply best_config.yaml (run ${{ github.run_id }})"
+          git push -u origin "$BR"
+          gh pr create --fill --title "Apply tuned best_config (run ${{ github.run_id }})" --body "Automated PR to apply best_config."
+
+      # ---- Auto-email HTML + CSV (report & edges) ----
+      - name: Email report
+        if: ${{ env.SMTP_HOST != '' && (inputs.mode == 'predict' || inputs.mode == 'report' || github.event_name == 'schedule') }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ env.SMTP_HOST }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USER }}
+          password: ${{ env.SMTP_PASS }}
+          subject: "NCAAF Agent – ${{ inputs.mode || 'scheduled' }} – ${{ github.run_id }}"
+          from: ${{ env.FROM_ADDR }}
+          to: ${{ env.TO_ADDRS }}
+          content_type: text/html
+          convert_markdown: false
+          attachments: |
+            artifacts/report.html
+            artifacts/edges.csv
+            artifacts/predictions.csv
+
+      # ---- Optional Slack ping ----
+      - name: Slack webhook
+        if: ${{ env.SLACK_WEBHOOK != '' && (inputs.mode == 'predict' || inputs.mode == 'report' || github.event_name == 'schedule') }}
+        run: |
+          SUMMARY=$(python - << 'PY'
+import json, pathlib
+p = pathlib.Path("artifacts/edges.csv")
+print("Edges CSV not found.") if not p.exists() else print(f"Edges ready: {p.stat().st_size} bytes")
+PY
+)
+          curl -X POST -H 'Content-type: application/json' --data "$(jq -n --arg t "${SUMMARY}" '{text: $t}')" "$SLACK_WEBHOOK"
