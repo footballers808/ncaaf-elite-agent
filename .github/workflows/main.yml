@@ -7,25 +7,20 @@ on:
         description: "Mode to run"
         required: true
         default: "predict"
-        type: choice
-        options: [predict, label, learn, report, backtest, tune]
       week:
         description: "ISO week (yyyy-ww) or 'auto'"
         required: false
         default: "auto"
       commit_best:
-        description: "If true, PR the merged tuned config"
+        description: "If 'true', open a PR applying the merged tuned config"
         required: false
         default: "false"
-        type: choice
-        options: ["false","true"]
   schedule:
-    # Weekly learning/report every Monday 6:00 AM America/Phoenix
+    # Weekly learning/report every Monday 06:00 America/Phoenix (13:00 UTC)
     - cron: "0 13 * * 1"
 
 permissions:
   contents: write
-  actions: read
 
 concurrency:
   group: ncaaf-elite-agent-${{ github.ref }}
@@ -44,7 +39,7 @@ jobs:
       SMTP_USER:     ${{ secrets.SMTP_USER }}
       SMTP_PASS:     ${{ secrets.SMTP_PASS }}
       FROM_ADDR:     ${{ secrets.FROM_ADDR }}
-      TO_ADDRS:      ${{ secrets.TO_ADDRS }}     # comma-separated
+      TO_ADDRS:      ${{ secrets.TO_ADDRS }}      # comma-separated
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }} # optional
 
     steps:
@@ -62,6 +57,7 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
+      # If you saved the tuner artifacts as an artifact named "tuning-results", restore it.
       - name: Restore tuned config (if exists)
         uses: actions/download-artifact@v4
         with:
@@ -70,7 +66,7 @@ jobs:
         continue-on-error: true
 
       - name: Apply tuned config (if present) + validate
-        if: ${{ inputs.mode != 'tune' }}
+        if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
         run: |
           if [ -f tuning-results/best_config.yaml ]; then
             echo "Found tuning-results/best_config.yaml"
@@ -81,44 +77,47 @@ jobs:
           fi
           python tools/validate_config.py
 
-      # ---- Modes ----
+      # -------- MODES --------
+
       - name: Predict
-        if: ${{ inputs.mode == 'predict' }}
+        if: ${{ github.event.inputs.mode == 'predict' }}
         run: |
-          python -m src.predict --week "${{ inputs.week }}" --out artifacts/predictions.csv
-          python -m src.odds   --week "${{ inputs.week }}" --out artifacts/market_lines.csv
+          python -m src.predict --week "${{ github.event.inputs.week }}" --out artifacts/predictions.csv
+          python -m src.odds   --week "${{ github.event.inputs.week }}" --out artifacts/market_lines.csv
           python -m src.edges  --pred artifacts/predictions.csv --lines artifacts/market_lines.csv --out artifacts/edges.csv
-          python -m src.report --week "${{ inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
+          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
 
       - name: Label
-        if: ${{ inputs.mode == 'label' }}
+        if: ${{ github.event.inputs.mode == 'label' }}
         run: |
-          python -m src.label --week "${{ inputs.week }}" --out artifacts/labels.csv
+          python -m src.label --week "${{ github.event.inputs.week }}" --out artifacts/labels.csv
 
       - name: Learn
-        if: ${{ inputs.mode == 'learn' }}
+        if: ${{ github.event.inputs.mode == 'learn' }}
         run: |
           python -m src.learn --labels artifacts/labels.csv --save artifacts/model.bin
           python -m src.eval  --report artifacts/learn-eval.json --calibration artifacts/calibration.png
 
       - name: Report
-        if: ${{ inputs.mode == 'report' }}
+        if: ${{ github.event.inputs.mode == 'report' }}
         run: |
-          python -m src.report --week "${{ inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
+          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
 
       - name: Backtest
-        if: ${{ inputs.mode == 'backtest' }}
+        if: ${{ github.event.inputs.mode == 'backtest' }}
         run: |
           python -m src.backtest --years 5 --cv time --out artifacts/backtest.json
-          python -m src.tune --mode verify-best --in tuning-results/best_config.yaml --out artifacts/tune-verify.json
+          if [ -f tuning-results/best_config.yaml ]; then
+            python -m src.tune --mode verify-best --in tuning-results/best_config.yaml --out artifacts/tune-verify.json
+          fi
 
       - name: Tune
-        if: ${{ inputs.mode == 'tune' }}
+        if: ${{ github.event.inputs.mode == 'tune' }}
         run: |
           python -m src.tune --search bayes --iters 60 --out tuning-results
           echo "Done."
 
-      # ---- Artifacts ----
+      # -------- ARTIFACTS --------
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -130,9 +129,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # ---- Optional: create PR with merged tuned config ----
+      # -------- OPTIONAL: PR to apply merged tuned config --------
       - name: Commit merged tuned config to branch
-        if: ${{ inputs.commit_best == 'true' && inputs.mode != 'tune' && hashFiles('config.merged.yaml') != '' }}
+        if: ${{ github.event.inputs.commit_best == 'true' && hashFiles('config.merged.yaml') != '' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -142,18 +141,18 @@ jobs:
           git add config.yaml
           git commit -m "chore: apply best_config.yaml (run ${{ github.run_id }})"
           git push -u origin "$BR"
-          gh pr create --fill --title "Apply tuned best_config (run ${{ github.run_id }})" --body "Automated PR to apply best_config."
+          echo "PR step skipped unless GH CLI is installed."
 
-      # ---- Auto-email HTML + CSV (report & edges) ----
+      # -------- EMAIL REPORT --------
       - name: Email report
-        if: ${{ env.SMTP_HOST != '' && (inputs.mode == 'predict' || inputs.mode == 'report' || github.event_name == 'schedule') }}
+        if: ${{ env.SMTP_HOST != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ env.SMTP_HOST }}
           server_port: ${{ env.SMTP_PORT }}
           username: ${{ env.SMTP_USER }}
           password: ${{ env.SMTP_PASS }}
-          subject: "NCAAF Agent – ${{ inputs.mode || 'scheduled' }} – ${{ github.run_id }}"
+          subject: "NCAAF Agent – ${{ github.event.inputs.mode }} – run ${{ github.run_id }}"
           from: ${{ env.FROM_ADDR }}
           to: ${{ env.TO_ADDRS }}
           content_type: text/html
@@ -163,14 +162,14 @@ jobs:
             artifacts/edges.csv
             artifacts/predictions.csv
 
-      # ---- Optional Slack ping ----
+      # -------- OPTIONAL SLACK --------
       - name: Slack webhook
-        if: ${{ env.SLACK_WEBHOOK != '' && (inputs.mode == 'predict' || inputs.mode == 'report' || github.event_name == 'schedule') }}
+        if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         run: |
-          SUMMARY=$(python - << 'PY'
-import json, pathlib
-p = pathlib.Path("artifacts/edges.csv")
-print("Edges CSV not found.") if not p.exists() else print(f"Edges ready: {p.stat().st_size} bytes")
-PY
-)
-          curl -X POST -H 'Content-type: application/json' --data "$(jq -n --arg t "${SUMMARY}" '{text: $t}')" "$SLACK_WEBHOOK"
+          if [ -f artifacts/edges.csv ]; then
+            MSG="Edges ready for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
+          else
+            MSG="No edges.csv found for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
+          fi
+          curl -X POST -H "Content-type: application/json" \
+            --data "{\"text\":\"${MSG}\"}" "$SLACK_WEBHOOK"
