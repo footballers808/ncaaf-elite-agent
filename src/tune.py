@@ -1,5 +1,5 @@
 # src/tune.py
-import os, json, yaml, pathlib, shutil, time, subprocess, sys, random, textwrap
+import os, json, yaml, pathlib, shutil, time, subprocess, sys, random
 from typing import Dict, Any, Optional
 import optuna
 
@@ -11,9 +11,10 @@ TRIALS_CSV = OUT_DIR / "trials.csv"
 ARTIFACTS_DIR = ROOT / "artifacts"
 BACKTEST_OUT_DIR = ARTIFACTS_DIR / "backtest_out"
 
-# If set to "1", we will return neutral metrics on repeated backtest failure
+# When set to "1", return neutral metrics after repeated backtest failures
 FAIL_OPEN = os.environ.get("TUNE_FAIL_OPEN", "0") == "1"
 
+# ------------------- Search space (adjust as you like) -------------------
 SEARCH_SPACE = {
     ("train","learning_rate"): ("loguniform", 1e-4, 5e-2),
     ("train","weight_decay"):  ("loguniform", 1e-7, 1e-2),
@@ -27,11 +28,12 @@ SEARCH_SPACE = {
     ("edge","threshold_total"):  ("uniform", 1.5, 4.0),
 }
 
-def load_yaml(p): 
-    with open(p, "r", encoding="utf-8") as f: 
-        return yaml.safe_load(f)
+# ------------------- helpers -------------------
+def load_yaml(p: pathlib.Path) -> Dict[str, Any]:
+    with open(p, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
-def save_yaml(obj, p):
+def save_yaml(obj: Dict[str, Any], p: pathlib.Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         yaml.safe_dump(obj, f, sort_keys=False, allow_unicode=True)
@@ -42,7 +44,7 @@ def set_nested(cfg: Dict[str, Any], path, value):
         d = d.setdefault(k, {})
     d[path[-1]] = value
 
-def _s(trial, spec):
+def _suggest(trial: optuna.Trial, spec):
     kind, *args = spec
     key = f"p_{trial.number}_{len(trial.params)}"
     if kind == "uniform":    return trial.suggest_float(key, *args)
@@ -51,19 +53,19 @@ def _s(trial, spec):
     if kind == "choice":     return trial.suggest_categorical(key, args[0])
     raise ValueError(kind)
 
-def build_cfg_from_trial(base_cfg: Dict[str, Any], trial) -> Dict[str, Any]:
-    cfg = yaml.safe_load(yaml.dump(base_cfg))
+def build_cfg_from_trial(base_cfg: Dict[str, Any], trial: optuna.Trial) -> Dict[str, Any]:
+    cfg = yaml.safe_load(yaml.dump(base_cfg))  # deep copy
     for path, spec in SEARCH_SPACE.items():
-        set_nested(cfg, path, _s(trial, spec))
+        set_nested(cfg, path, _suggest(trial, spec))
     cfg.setdefault("eval", {}).setdefault("split", "temporal")
     return cfg
 
 def _tail(s: str, n: int = 200) -> str:
-    lines = [ln for ln in s.splitlines() if ln.strip() != ""]
+    lines = [ln for ln in s.splitlines() if ln.strip()]
     return "\n".join(lines[-n:])
 
-def _find_new_json(snap_before: set[pathlib.Path]) -> Optional[pathlib.Path]:
-    candidates = [p for p in ARTIFACTS_DIR.rglob("*.json") if p not in snap_before]
+def _find_new_json(snapshot: set[pathlib.Path]) -> Optional[pathlib.Path]:
+    candidates = [p for p in ARTIFACTS_DIR.rglob("*.json") if p not in snapshot]
     if not candidates:
         return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -72,8 +74,9 @@ def _find_new_json(snap_before: set[pathlib.Path]) -> Optional[pathlib.Path]:
             return p
     return candidates[0]
 
+# ------------------- backtest runner -------------------
 def run_backtest() -> Dict[str, Any]:
-    # Clean output dir
+    # prepare out dir
     if BACKTEST_OUT_DIR.exists():
         if BACKTEST_OUT_DIR.is_dir():
             shutil.rmtree(BACKTEST_OUT_DIR)
@@ -81,8 +84,8 @@ def run_backtest() -> Dict[str, Any]:
             BACKTEST_OUT_DIR.unlink()
     BACKTEST_OUT_DIR.mkdir(parents=True, exist_ok=True)
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-
     before = set(ARTIFACTS_DIR.rglob("*.json"))
+
     cmd = [sys.executable, "-m", "src.backtest", "--years", "5", "--out", str(BACKTEST_OUT_DIR)]
 
     max_attempts = 5
@@ -95,38 +98,35 @@ def run_backtest() -> Dict[str, Any]:
         if proc.returncode == 0:
             p = _find_new_json(before) or max(BACKTEST_OUT_DIR.rglob("*.json"), default=None, key=lambda x: x.stat().st_mtime)
             if p is None:
-                raise FileNotFoundError("Backtest succeeded but no JSON found in artifacts/")
+                raise FileNotFoundError("Backtest exited 0 but no metrics JSON found.")
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
 
-        # Non-zero: back off and retry
+        # failure: backoff + retry
         if attempt < max_attempts:
             sleep_s = min(30, 2 ** attempt) + random.uniform(0, 0.5)
-            print(f"Backtest failed (exit {proc.returncode}); retrying in {sleep_s:.1f}s...")
+            print(f"Backtest failed (exit {proc.returncode}); retrying in {sleep_s:.1f}s…")
             time.sleep(sleep_s)
 
-    # Reached here = all attempts failed
-    msg = "backtest command failed after retries"
+    # all attempts failed
     if FAIL_OPEN:
-        print("WARNING:", msg, "— returning neutral metrics to continue tuning.")
-        return {
-            "overall": {"logloss": 0.693147, "brier": 0.25, "roi": 0.0, "sharpe": 0.0},
-            "failed": True,
-            "note": msg,
-        }
-    raise RuntimeError(msg)
+        print("WARNING: backtest failed after retries — returning neutral metrics to continue tuning.")
+        return {"overall": {"logloss": 0.693147, "brier": 0.25, "roi": 0.0, "sharpe": 0.0}, "failed": True}
+    raise RuntimeError("backtest command failed after retries")
 
 def objective_from_metrics(metrics: Dict[str, Any]) -> float:
     overall = metrics.get("overall", {})
     if "logloss" in overall and isinstance(overall["logloss"], (int, float)):
         return float(overall["logloss"])
-    # Fallback to inverse Sharpe if logloss missing
     sharpe = float(overall.get("sharpe", 0.0))
     return 1.0 / (abs(sharpe) + 1e-6)
 
+# ------------------- main -------------------
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     base_cfg = load_yaml(CFG_PATH)
+
+    # keep pristine copy and always restore it
     base_copy = ROOT / "config.base.yaml"
     shutil.copyfile(CFG_PATH, base_copy)
 
@@ -139,22 +139,20 @@ def main():
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=6),
     )
 
-    # Trial CSV
-    header_written = False
     iters = int(os.environ.get("TUNE_ITERS", "8"))
+    header_written = False
 
-    def write_row(row: Dict[str, Any]):
+    def write_csv_row(row: Dict[str, Any]):
         nonlocal header_written
         TRIALS_CSV.parent.mkdir(parents=True, exist_ok=True)
-        if not header_written or not pathlib.Path(TRIALS_CSV).exists():
+        if not header_written or not TRIALS_CSV.exists():
             with open(TRIALS_CSV, "w", encoding="utf-8") as f:
                 f.write(",".join(row.keys()) + "\n")
             header_written = True
         with open(TRIALS_CSV, "a", encoding="utf-8") as f:
             f.write(",".join(str(row[k]) for k in row.keys()) + "\n")
 
-    def objective(trial):
-        # Build temp config
+    def objective(trial: optuna.Trial) -> float:
         cfg = build_cfg_from_trial(base_cfg, trial)
         temp_cfg = ROOT / "config.temp.yaml"
         save_yaml(cfg, temp_cfg)
@@ -164,31 +162,32 @@ def main():
         try:
             metrics = run_backtest()
         finally:
+            # always restore
             shutil.copyfile(base_copy, CFG_PATH)
         dt = time.time() - t0
 
         overall = metrics.get("overall", {})
         value = objective_from_metrics(metrics)
 
-        # Flatten config used
-        flat = {"trial": trial.number, "value": float(value), "seconds": round(dt, 3)}
+        # Flatten config + metrics for CSV and Optuna attrs
+        row = {"trial": trial.number, "value": float(value), "seconds": round(dt, 3)}
         for path in SEARCH_SPACE:
             d = cfg
             for k in path:
                 d = d[k]
-            flat[".".join(path)] = d
+            row[".".join(path)] = d
         for k, v in overall.items():
             if isinstance(v, (int, float)):
-                flat[k] = float(v)
+                row[k] = float(v)
                 trial.set_user_attr(k, float(v))
-        write_row(flat)
+        write_csv_row(row)
 
-        # Gentle pause between trials
-        time.sleep(1.5)
+        time.sleep(1.5)  # small pause helps rate limits
         return value
 
     study.optimize(objective, n_trials=iters, gc_after_trial=True)
 
+    # reconstruct best config
     best = study.best_trial
     best_cfg = yaml.safe_load(yaml.dump(base_cfg))
     for i, path in enumerate(SEARCH_SPACE.keys()):
