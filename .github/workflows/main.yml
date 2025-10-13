@@ -16,6 +16,7 @@ on:
         required: false
         default: "false"
   schedule:
+    # Weekly learning/report every Monday 06:00 America/Phoenix (13:00 UTC)
     - cron: "0 13 * * 1"
 
 permissions:
@@ -38,8 +39,8 @@ jobs:
       SMTP_USER:     ${{ secrets.SMTP_USER }}
       SMTP_PASS:     ${{ secrets.SMTP_PASS }}
       FROM_ADDR:     ${{ secrets.FROM_ADDR }}
-      TO_ADDRS:      ${{ secrets.TO_ADDRS }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      TO_ADDRS:      ${{ secrets.TO_ADDRS }}      # comma-separated
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }} # optional
 
     steps:
       - name: Checkout
@@ -56,13 +57,16 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
+      # 🔧 Only try to restore prior tuned artifacts when NOT tuning.
       - name: Restore tuned config (if exists)
+        if: ${{ github.event.inputs.mode != 'tune' }}
         uses: actions/download-artifact@v4
         with:
           name: tuning-results
           path: tuning-results
         continue-on-error: true
 
+      # 🔧 Skip apply/validate during 'tune' mode
       - name: Apply tuned config (if present) + validate
         if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
         run: |
@@ -74,6 +78,8 @@ jobs:
             echo "No tuning best_config.yaml found; proceeding with current config.yaml"
           fi
           python tools/validate_config.py
+
+      # -------- MODES --------
 
       - name: Predict
         if: ${{ github.event.inputs.mode == 'predict' }}
@@ -114,6 +120,7 @@ jobs:
         run: |
           python -m src.tune
 
+      # -------- ARTIFACTS --------
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -125,6 +132,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # -------- OPTIONAL: PR to apply merged tuned config --------
       - name: Commit merged tuned config to branch
         if: ${{ github.event.inputs.commit_best == 'true' && hashFiles('config.merged.yaml') != '' }}
         run: |
@@ -138,6 +146,7 @@ jobs:
           git push -u origin "$BR"
           echo "PR step skipped unless GH CLI is installed."
 
+      # -------- EMAIL REPORT --------
       - name: Email report
         if: ${{ env.SMTP_HOST != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         uses: dawidd6/action-send-mail@v3
@@ -156,6 +165,7 @@ jobs:
             artifacts/edges.csv
             artifacts/predictions.csv
 
+      # -------- OPTIONAL SLACK --------
       - name: Slack webhook
         if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         run: |
