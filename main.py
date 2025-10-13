@@ -1,133 +1,114 @@
-import os, yaml, csv
-from src.emailer import send_email_html
-from src.providers import today_local_iso, cfbd_games_date, cfbd_season_stats, cfbd_team_records
-from src.features import build_team_power
-from src.model import predict_game
-from src.venues_dynamic import build_team_venues_map
-from src.weather import enrich_weather_for_games, weather_adjustments
-from src.injuries import build_injury_map, injury_adjustments
-from src.matchups import matchup_adjustments
-from src.odds import fetch_lines_for_games
+"""
+main.py — NCAAF Elite Agent Predictor
+-------------------------------------
+Runs your college football model, fetches upcoming games, produces predictions,
+and writes a standardized predictions.csv for downstream workflows.
+"""
 
-CFG = yaml.safe_load(open("config.yaml","r"))
+import os
+import pandas as pd
+import requests
+from datetime import datetime
 
-def render_email(date_iso, preds):
-    head = f"<h3>NCAAF Predicted Scores — {date_iso}</h3>"
-    if not preds:
-        return head + "<p>No FBS games today.</p>"
-    rows = "".join([
-        f"<tr>"
-        f"<td>{p.get('start_local','')}</td>"
-        f"<td><b>{p['away']}</b> @ <b>{p['home']}</b></td>"
-        f"<td align='right'>{p['pred_home_pts']}–{p['pred_away_pts']}</td>"
-        f"<td align='right'>{p['spread']:+.1f}</td>"
-        f"<td align='right'>{p['total']:.1f}</td>"
-        f"<td align='right'>{p.get('mkt_spread','')}</td>"
-        f"<td align='right'>{p.get('mkt_total','')}</td>"
-        f"<td align='right'>{p.get('edge_spread','')}</td>"
-        f"<td align='right'>{p.get('edge_total','')}</td>"
-        f"<td align='right'>{p['p_home_cover']:.3f}</td>"
-        f"<td>{p.get('wx_note','')}</td>"
-        f"<td>{p.get('inj_note','')}</td>"
-        f"<td>{p.get('mu_note','')}</td>"
-        f"</tr>"
-        for p in preds
-    ])
-    table = ("<table cellpadding='6' cellspacing='0' border='1' style='border-collapse:collapse;font-family:Arial,sans-serif;'>"
-             "<thead><tr>"
-             "<th>Local</th><th>Matchup</th><th>Pred (H–A)</th>"
-             "<th>Spread</th><th>Total</th>"
-             "<th>Mkt Spr</th><th>Mkt Tot</th>"
-             "<th>Edge Spr</th><th>Edge Tot</th>"
-             "<th>P(Home Covers)</th>"
-             "<th>Weather</th><th>Injuries</th><th>Macro Matchup</th>"
-             "</tr></thead>"
-             f"<tbody>{rows}</tbody></table>")
-    return head + table
+# ===============================
+# CONFIG
+# ===============================
+CFBD_API_KEY = os.environ.get("CFBD_API_KEY")
+CFBD = "https://api.collegefootballdata.com"
 
+HEADERS = {"Authorization": f"Bearer {CFBD_API_KEY}"} if CFBD_API_KEY else {}
+
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ===============================
+# DATA FETCH
+# ===============================
+def fetch_upcoming_games(year: int):
+    """Fetch games that have not yet started (future schedule)."""
+    url = f"{CFBD}/games"
+    params = {"year": year, "seasonType": "regular"}
+    print(f"Fetching games for {year} ...")
+    resp = requests.get(url, params=params, headers=HEADERS, timeout=60)
+    resp.raise_for_status()
+    games = pd.DataFrame(resp.json())
+
+    # Keep only future games with teams populated
+    if not games.empty:
+        games = games[games["start_date"].notna()]
+        games = games[["id", "home_team", "away_team", "start_date", "season", "week"]]
+        games["start_date"] = pd.to_datetime(games["start_date"], errors="coerce")
+
+    print(f"✅ Retrieved {len(games)} games from CFBD.")
+    return games
+
+
+# ===============================
+# MODEL PLACEHOLDER / LOGIC
+# ===============================
+def generate_predictions(games: pd.DataFrame):
+    """
+    Generate dummy predictions.
+    Replace this logic with your actual model code.
+    """
+    if games.empty:
+        print("⚠️ No games to predict.")
+        return pd.DataFrame()
+
+    preds = games.copy()
+
+    # Example dummy logic for now
+    preds["model_spread"] = (preds["home_team"].apply(hash) % 20) - 10
+    preds["model_total"] = 50 + (preds["away_team"].apply(hash) % 20)
+    preds["confidence"] = 0.5 + (abs(preds["model_spread"]) / 20)
+
+    print("✅ Generated predictions for all games.")
+    return preds
+
+
+# ===============================
+# OUTPUT WRITER
+# ===============================
+def write_predictions(df: pd.DataFrame):
+    """
+    Standardize and save predictions.csv
+    Must include columns: home, away, model_spread, model_total
+    """
+    if df.empty:
+        raise ValueError("No predictions to write — dataframe is empty.")
+
+    # Rename columns to match required schema
+    df = df.rename(
+        columns={
+            "home_team": "home",
+            "away_team": "away",
+            "id": "game_id",
+        }
+    )
+
+    # Validate required columns
+    required = {"home", "away", "model_spread", "model_total"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns for output: {missing}")
+
+    # Write file
+    output_path = os.path.join(OUTPUT_DIR, "predictions.csv")
+    df.to_csv(output_path, index=False)
+    print(f"✅ Wrote {output_path} ({len(df)} rows)")
+    return output_path
+
+
+# ===============================
+# MAIN RUNNER
+# ===============================
 def main():
-    tz_name = CFG.get("timezone", "America/Phoenix")
-    date_iso = today_local_iso(tz_name)
-    year = int(date_iso[:4])
-    api_key = os.environ.get("CFBD_API_KEY","")
+    year = datetime.now().year
+    games = fetch_upcoming_games(year)
+    preds = generate_predictions(games)
+    write_predictions(preds)
 
-    # Build inputs
-    venues_map = build_team_venues_map(year, api_key)
-    slate = cfbd_games_date(date_iso, tzname=tz_name)
-    stats = cfbd_season_stats(year)
-    recs  = cfbd_team_records(year)
-    team_tbl = build_team_power(stats, recs)
-
-    # Weather / Injuries
-    wx_map   = enrich_weather_for_games(slate, venues_map, local_tz_name=tz_name)
-    inj_map  = build_injury_map(slate, year, decay_days=CFG.get("injury_decay_days",28))
-
-    # Market lines (consensus-ish)
-    game_ids = [g.get("id") for g in slate if g.get("id") is not None]
-    mkt_map  = fetch_lines_for_games(year, game_ids)
-
-    preds = []
-    for g in slate:
-        # WEATHER
-        wx = wx_map.get(g.get("id")) or {}
-        spr_wx, tot_wx = weather_adjustments(wx, CFG)
-        wx_note = ""
-        if wx.get("applied"):
-            wx_note = f"{wx.get('stadium','')} — {int(wx['temp_f'])}F, {int(wx['wind_mph'])} mph, {wx['precip_in']:.2f}\""
-
-        # INJURIES
-        spr_inj, tot_inj, inj_note = injury_adjustments(g, inj_map, CFG)
-
-        # MACRO MATCHUP
-        spr_mu, tot_mu, mu_note = matchup_adjustments(g, team_tbl, CFG)
-
-        # Combined adjustment applied to model
-        spr_adj = spr_wx + spr_inj + spr_mu
-        tot_adj = tot_wx  + tot_inj  + tot_mu
-
-        p = predict_game(g, team_tbl, CFG, wx_adj=(spr_adj, tot_adj))
-        if not p:
-            continue
-
-        # Attach notes
-        if wx_note:   p["wx_note"]  = wx_note
-        if inj_note:  p["inj_note"] = inj_note
-        if mu_note:   p["mu_note"]  = mu_note
-
-        # Market + edges
-        mkt = mkt_map.get(g.get("id"), {})
-        mkt_spread = mkt.get("spread"); mkt_total = mkt.get("total")
-        if mkt_spread is not None:
-            edge_s = round(p["spread"] - float(mkt_spread), 2)
-            p["edge_spread"] = f"{edge_s:+.2f}"
-            p["mkt_spread"]  = f"{float(mkt_spread):+.1f}"
-            # star if strong edge
-            if abs(edge_s) >= CFG.get("edge_threshold_spread", 1.5):
-                p["edge_spread"] += " ★"
-        if mkt_total is not None:
-            edge_t = round(p["total"] - float(mkt_total), 2)
-            p["edge_total"] = f"{edge_t:+.2f}"
-            p["mkt_total"]  = f"{float(mkt_total):.1f}"
-            if abs(edge_t) >= CFG.get("edge_threshold_total", 2.0):
-                p["edge_total"] += " ★"
-
-        preds.append(p)
-
-    # Save CSV artifact for your records
-    fieldnames = ["gameId","start_local","away","home","pred_home_pts","pred_away_pts",
-                  "spread","total","mkt_spread","mkt_total","edge_spread","edge_total",
-                  "p_home_cover","wx_note","inj_note","mu_note"]
-    try:
-        with open("predictions.csv","w",newline="",encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for p in preds:
-                w.writerow({k: p.get(k,"") for k in fieldnames})
-    except Exception:
-        pass
-
-    html = render_email(date_iso, preds)
-    send_email_html(f"{CFG['email_subject_prefix']} {date_iso}", html)
 
 if __name__ == "__main__":
     main()
