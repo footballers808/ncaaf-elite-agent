@@ -1,64 +1,114 @@
 # src/labeler.py
 from __future__ import annotations
 
+import argparse
 import os
-import time
-from typing import Optional, List, Dict
+from datetime import datetime
+from typing import Iterable, Optional
 
 import pandas as pd
 import requests
 
-STORE_DIR = "store"
-os.makedirs(STORE_DIR, exist_ok=True)
 
 CFBD = "https://api.collegefootballdata.com"
 
-def fetch_completed_games(year: int, week: Optional[int] = None) -> List[Dict]:
-    """Fetch games with final scores; requires CFBD_API_KEY in env."""
+
+def _pick(cols: Iterable[str], choices: Iterable[str]) -> Optional[str]:
+    lower = {c.lower(): c for c in cols}
+    for c in choices:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    return None
+
+
+def _headers() -> dict:
     api_key = os.environ.get("CFBD_API_KEY")
     if not api_key:
-        raise RuntimeError("CFBD_API_KEY is not set in environment.")
-    headers = {"Authorization": f"Bearer {api_key}"}
+        raise EnvironmentError("Missing CFBD_API_KEY secret.")
+    return {"Authorization": f"Bearer {api_key}"}
 
-    params: Dict[str, object] = {"year": year}
-    if week is not None:
-        params["week"] = week
 
-    r = requests.get(f"{CFBD}/games", params=params, headers=headers, timeout=60)
+def fetch_completed_games(year: int, season_type: str = "regular") -> pd.DataFrame:
+    """
+    Pull games for a season; keep only rows that have final scores.
+    """
+    url = f"{CFBD}/games"
+    params = {"year": year, "seasonType": season_type}
+    r = requests.get(url, params=params, headers=_headers(), timeout=60)
     r.raise_for_status()
-    data = r.json()
+    raw = pd.DataFrame(r.json())
 
-    games = [
-        g for g in data
-        if g.get("home_points") is not None and g.get("away_points") is not None
-    ]
-    return games
+    if raw.empty:
+        print(f"⚠️ CFBD returned 0 rows for year={year} seasonType={season_type}")
+        return raw
 
-def build_labels(games: List[Dict]) -> pd.DataFrame:
-    if not games:
-        return pd.DataFrame()
-    df = pd.DataFrame(games).rename(columns={
-        "id": "game_id",
-        "home_team": "home",
-        "away_team": "away",
-    })
-    df["actual_spread"] = df["home_points"] - df["away_points"]
-    df["actual_total"]  = df["home_points"] + df["away_points"]
-    return df[["game_id", "home", "away", "actual_spread", "actual_total"]]
+    cols = list(raw.columns)
 
-def main(year: Optional[int] = None, week: Optional[int] = None) -> None:
-    if year is None:
-        year = int(time.strftime("%Y"))
-    games = fetch_completed_games(year, week)
-    labels = build_labels(games)
+    id_col = _pick(cols, ["id", "game_id", "gameId"])
+    home_col = _pick(cols, ["home_team", "home", "homeName"])
+    away_col = _pick(cols, ["away_team", "away", "awayName"])
+    hp_col = _pick(cols, ["home_points", "home_score", "HomePoints"])
+    ap_col = _pick(cols, ["away_points", "away_score", "AwayPoints"])
 
-    out_path = os.path.join(STORE_DIR, "labels.parquet")
-    if labels.empty:
-        print("⚠️ No completed games found; writing placeholder labels.parquet")
-        pd.DataFrame(columns=["game_id","home","away","actual_spread","actual_total"]).to_parquet(out_path, index=False)
-    else:
-        labels.to_parquet(out_path, index=False)
-        print(f"✅ Wrote labels: {out_path} (rows={len(labels)})")
+    missing = []
+    if not id_col:
+        missing.append("id/game_id")
+    if not home_col:
+        missing.append("home_team/home")
+    if not away_col:
+        missing.append("away_team/away")
+    if not hp_col:
+        missing.append("home_points/home_score")
+    if not ap_col:
+        missing.append("away_points/away_score")
+
+    if missing:
+        raise ValueError(f"CFBD /games missing expected columns: {missing}")
+
+    out = pd.DataFrame(
+        {
+            "game_id": raw[id_col],
+            "home": raw[home_col],
+            "away": raw[away_col],
+            "home_points": raw[hp_col],
+            "away_points": raw[ap_col],
+        }
+    )
+
+    # Final only
+    out = out[out["home_points"].notna() & out["away_points"].notna()].copy()
+
+    # Normalize dtypes
+    out["game_id"] = pd.to_numeric(out["game_id"], errors="coerce")
+    out = out.dropna(subset=["game_id"]).copy()
+    out["game_id"] = out["game_id"].astype("int64")
+
+    out = out.drop_duplicates(subset=["game_id"]).reset_index(drop=True)
+    return out
+
+
+def _save_labels(df: pd.DataFrame) -> str:
+    os.makedirs("store", exist_ok=True)
+    path = os.path.join("store", "labels.parquet")
+    df.to_parquet(path, index=False)
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--year", type=int, default=datetime.utcnow().year)
+    parser.add_argument("--season-type", type=str, default="regular",
+                        help="regular|postseason|both (CFBD seasonType)")
+    args = parser.parse_args()
+
+    df = fetch_completed_games(args.year, args.season_type)
+    if df.empty:
+        print("⚠️ No completed games found; nothing to write.")
+        return
+
+    path = _save_labels(df)
+    print(f"✅ Wrote {path} with {len(df)} rows and columns {list(df.columns)}")
+
 
 if __name__ == "__main__":
     main()
