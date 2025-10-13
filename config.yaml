@@ -1,12 +1,28 @@
+timezone: America/Phoenix
+email_subject_prefix: "[NCAAF Agent] Predictions"
+
+# Model knobs
+hfa_points: 2.0
+power_scale: 0.035
+sigma_points: 13.0
+min_total_floor: 34.0
+max_total_cap: 76.0
+
+# Weather knobs
+wind_total_penalty_per_mph: 0.10
+gust_total_penalty_per_mph: 0.05
+cold_total_penalty: 1.5
+precip_total_penalty: 1.0
+
 # Injury knobs
-injury_spread_weight_per_point: 0.45   # converts injury burden diff to spread points
-injury_total_weight_per_point:  0.20   # converts combined burden to total points
-injury_decay_days: 28                  # older reports decayed
+injury_spread_weight_per_point: 0.45
+injury_total_weight_per_point:  0.20
+injury_decay_days: 28
 
 # Matchup knobs
 matchup_spread_scale: 0.03
 matchup_total_scale:  0.03
 
-# Global caps (safety)
+# Global caps
 max_spread_adj_component: 3.0
 max_total_adj_component:  6.0
