@@ -1,40 +1,43 @@
-name: Daily NCAAF Agent
+name: Predict & Email
 
 on:
-  workflow_dispatch: {}          # manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: '0 14 * * *'         # 7 AM Phoenix daily
+    - cron: "0 14 * * 5"   # adjust to your preferred UTC schedule
 
 jobs:
-  run:
+  predict:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: pip
+          python-version: "3.11"
 
-      - name: Validate secrets
+      # Optional: verify required secrets exist (bash, not Python here-doc)
+      - name: Verify required secrets
+        shell: bash
         run: |
-          python - << 'PY'
-          import os, sys
-          required = ['SMTP_SERVER','SMTP_PORT','EMAIL_USER','EMAIL_PASS','EMAIL_TO']
-          missing = [k for k in required if not os.environ.get(k)]
-          if missing:
-              print("Missing secrets:", missing); sys.exit(1)
-          print("✅ Secrets OK")
-          PY
+          missing=()
+          for k in SMTP_SERVER SMTP_PORT EMAIL_USER EMAIL_PASS EMAIL_TO CFBD_API_KEY; do
+            if [[ -z "${!k}" ]]; then missing+=("$k"); fi
+          done
+          if (( ${#missing[@]} )); then
+            echo "Missing secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "✅ Secrets OK"
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT:   ${{ secrets.SMTP_PORT }}
           EMAIL_USER:  ${{ secrets.EMAIL_USER }}
           EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
           EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
 
       - name: Install deps
         run: pip install -r requirements.txt
@@ -49,10 +52,11 @@ jobs:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}   # must exist in repo secrets
         run: python main.py
 
-        - name: Upload predictions artifact
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: predictions
-        path: predictions.csv
-        if-no-files-found: ignore
+      - name: Upload predictions artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictions
+          path: predictions.csv
+          if-no-files-found: ignore
+
