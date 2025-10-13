@@ -1,63 +1,62 @@
-# config.yaml
-
-# ---- Reporting & notifications ----
+edge_tiers:
+  spread:
+  - 1.5
+  - 2.5
+  - 4.0
+  total:
+  - 2.0
+  - 3.0
+  - 4.5
+hfa_points: 2.0
+learn:
+  enabled: true
+  hfa_points_for_learn: 2.0
+  k_factor: 0.25
+  margin_cap: 24
+  weekly_decay: 0.0
+max_total_cap: 78.0
+min_total_floor: 36.0
+news:
+  enabled: true
+  sentiment_cap: 1.5
+  sentiment_weight_spread: 0.6
+  sentiment_weight_total: 0.0
+odds:
+  enabled: true
+  preferred_providers:
+  - DraftKings
+  - FanDuel
+  - Caesars
+  - BetMGM
+power_scale: 1.0
 report:
   enabled: true
   min_games_for_report: 5
-  to: ["your@email.com"]
-
-# ---- Market odds settings ----
-odds:
-  enabled: true
-  preferred_providers: ["DraftKings", "FanDuel", "Caesars", "BetMGM"]
-
-# ---- News sentiment weighting ----
-news:
-  enabled: true
-  sentiment_weight_spread: 0.6
-  sentiment_weight_total: 0.0
-  sentiment_cap: 1.5
-
-# ---- Edge tier thresholds ----
-edge_tiers:
-  spread: [1.5, 2.5, 4.0]
-  total:  [2.0, 3.0, 4.5]
-
-# ---- Optional model knobs ----
-power_scale: 1.0
-hfa_points: 2.0
-min_total_floor: 36.0
-max_total_cap: 78.0
-sigma_points: 13.0
-
-# How the total is split between teams (exact score)
-score_split_w_offense: 0.55
+  to:
+  - your@email.com
+score_split_gain: 0.03
 score_split_w_defense: 0.35
-score_split_w_pace:    0.10
-score_split_gain:      0.03   # ↑ makes the split more extreme; ↓ makes it closer to 50/50
-
-learn:
-  schedule: "weekly"          # informational, used by your runner
-  min_labels: 50              # wait until at least this many fresh labels before fitting
-  drift_check:
-    enabled: true
-    metric: "psi"             # or "jsd"
-    threshold: 0.2
-  calibration:
-    method: "isotonic"
-    refit_each_learn: true
-
+score_split_w_offense: 0.55
+score_split_w_pace: 0.1
+sigma_points: 13.0
 staking:
-  method: "kelly_fractional"
   kelly_fraction: 0.25
-  unit_cap: 1.0               # at most 1u per play (risk control)
+  method: kelly_fractional
+  unit_cap: 1.0
+train:
+  learning_rate: 0.0010253509690168502
+  weight_decay: 0.005669849511478858
+  max_depth: 8
+  n_estimators: 759
+data:
+  lookback_days: 36
+  gap_days: 0
+eval:
+  cv_folds: 3
+  calibration: none
+edge:
+  threshold_spread: 1.0514612357395061
+  threshold_total: 3.9247746304049858
 
-
-learn:
-  enabled: true
-  k_factor: 0.25        # how fast powers move per game (0.15–0.35 is typical)
-  margin_cap: 24        # cap on point margin used for learning
-  weekly_decay: 0.00    # 0.00 = no decay; try 0.01–0.03 to slowly pull toward 0 each week
-  hfa_points_for_learn: 2.0  # HFA used when computing expected margin
 
 
