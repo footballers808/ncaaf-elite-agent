@@ -4,15 +4,16 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import math
 import requests
 import pandas as pd
 import numpy as np
 
+from . import news  # NEW: bring in team sentiment
+
 CFBD = "https://api.collegefootballdata.com"
 
 
-# ----------------------- your helper (kept) -----------------------
+# ----------------------- unchanged helper -----------------------
 def prob_home_covers(line, mu, sigma=13.0):
     from math import erf
     z = (mu - line) / max(1e-6, sigma)
@@ -46,6 +47,23 @@ def predict_game(game, team_tbl, cfg):
         np.clip(total, cfg.get("min_total_floor", 36.0), cfg.get("max_total_cap", 78.0))
     )
 
+    # ----------------------- NEWS ADJUSTMENT (NEW) -----------------------
+    ncfg = (cfg.get("news") or {})
+    enable_news = ncfg.get("enabled", True)
+    if enable_news:
+        w_spread = float(ncfg.get("sentiment_weight_spread", 0.6))  # points per 1.0 sentiment delta
+        w_total  = float(ncfg.get("sentiment_weight_total", 0.0))   # optional for totals
+        cap      = float(ncfg.get("sentiment_cap", 1.5))            # cap the delta before weighting
+
+        s_home = float(news.get_team_sentiment(home, cfg))
+        s_away = float(news.get_team_sentiment(away, cfg))
+        # Positive means home has better news vs away
+        s_delta = max(-cap, min(cap, (s_home - s_away)))
+        spread += w_spread * s_delta
+        total  += w_total  * s_delta
+
+    # --------------------------------------------------------------------
+
     home_pts = (total + spread) / 2.0
     away_pts = (total - spread) / 2.0
     p_cover = prob_home_covers(spread, spread, sigma=cfg.get("sigma_points", 13.0))
@@ -60,6 +78,15 @@ def predict_game(game, team_tbl, cfg):
         pred_home_pts=int(round(home_pts)),
         pred_away_pts=int(round(away_pts)),
         p_home_cover=round(float(p_cover), 3),
+        # helpful text for email
+        matchup=f"{away} @ {home}",
+        model_text=f"{home} {spread:+.1f}, total {total:.1f}",
+        market_text="",  # fill from odds when ready
+        # rationale hints:
+        news_note=f"newsΔ={s_delta:+.2f}" if enable_news else "",
+        macro_note="",
+        pace_note="",
+        weather_note="",
     )
 
 
@@ -75,12 +102,10 @@ def _season_year_from_cfg(cfg: Dict[str, Any]) -> int:
     y = cfg.get("season_year")
     if isinstance(y, int):
         return y
-    # default: current UTC year
     return datetime.now(timezone.utc).year
 
 
 def _fetch_upcoming_games(year: int) -> List[Dict[str, Any]]:
-    # Use CFBD /games for the season and filter to not-yet-started games (approx).
     url = f"{CFBD}/games"
     params = {"year": year, "seasonType": "regular"}
     r = requests.get(url, params=params, headers=_headers(), timeout=60)
@@ -88,7 +113,6 @@ def _fetch_upcoming_games(year: int) -> List[Dict[str, Any]]:
     rows = r.json()
     out = []
     for g in rows:
-        # Keep rows that have teams but may not yet have final scores
         if g.get("home_team") and g.get("away_team"):
             out.append(
                 {
@@ -103,11 +127,6 @@ def _fetch_upcoming_games(year: int) -> List[Dict[str, Any]]:
 
 
 def _build_naive_team_table(year: int) -> pd.DataFrame:
-    """
-    VERY NAIVE fallback team table so the pipeline can run in CI.
-    If you already build a better table elsewhere, this will get replaced by your logic.
-    """
-    # Pull teams to at least know the team names; assign neutral powers.
     url = f"{CFBD}/teams/fbs"
     r = requests.get(url, headers=_headers(), timeout=60)
     r.raise_for_status()
@@ -115,7 +134,6 @@ def _build_naive_team_table(year: int) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame(columns=["team", "power", "off_ppg", "def_ppg", "pace_ppg"])
     df = pd.DataFrame({"team": raw["school"]})
-    # Flat baseline so we still produce predictions; you can plug in your real ratings later.
     df["power"] = 0.0
     df["off_ppg"] = 28.0
     df["def_ppg"] = 27.0
@@ -125,10 +143,6 @@ def _build_naive_team_table(year: int) -> pd.DataFrame:
 
 # ----------------------- Public pipeline API (adapters) -----------------------
 def predict_games(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Adapter entrypoint used by the runner. Produces a list of prediction dicts.
-    If your repo already has a richer predictor, swap this to call it.
-    """
     try:
         year = _season_year_from_cfg(cfg)
         games = _fetch_upcoming_games(year)
@@ -140,10 +154,6 @@ def predict_games(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         for g in games:
             row = predict_game(g, team_tbl, cfg or {})
             if row:
-                # Add some friendly text fields used by the email
-                row["matchup"] = f"{row['away']} @ {row['home']}"
-                row["model_text"] = f"{row['home']} -{abs(row['spread']):.1f}, total {row['total']:.1f}"
-                row["market_text"] = ""  # you can fill this from odds provider later
                 out.append(row)
         print(f"✅ Built {len(out)} predictions.")
         return out
@@ -153,21 +163,12 @@ def predict_games(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def load_model(cfg: Dict[str, Any]) -> Any:
-    """
-    Stub so CI runs. Replace with your real load if you have one.
-    """
     return {}
 
 
 def train_model(cfg: Dict[str, Any], model: Any, labeled_rows: List[Dict[str, Any]]) -> Any:
-    """
-    Stub (no-op). Replace with your learning logic; we keep it to preserve the pipeline shape.
-    """
     return model
 
 
 def save_model(cfg: Dict[str, Any], model: Any) -> None:
-    """
-    Stub (no-op). Replace to persist your model file if needed.
-    """
     return
