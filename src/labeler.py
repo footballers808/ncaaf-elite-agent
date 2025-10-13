@@ -14,10 +14,14 @@ CFBD = "https://api.collegefootballdata.com"
 
 
 def _pick(cols: Iterable[str], choices: Iterable[str]) -> Optional[str]:
-    lower = {c.lower(): c for c in cols}
+    """
+    Return first matching column (case-insensitive) from `choices`.
+    Works with snake_case and camelCase because we compare lowercased names.
+    """
+    lower_map = {c.lower(): c for c in cols}
     for c in choices:
-        if c.lower() in lower:
-            return lower[c.lower()]
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
     return None
 
 
@@ -30,7 +34,9 @@ def _headers() -> dict:
 
 def fetch_completed_games(year: int, season_type: str = "regular") -> pd.DataFrame:
     """
-    Pull games for a season; keep only rows that have final scores.
+    Pull games for a season; keep only rows that have final scores and
+    normalize to a standard schema:
+        game_id, home, away, home_points, away_points
     """
     url = f"{CFBD}/games"
     params = {"year": year, "seasonType": season_type}
@@ -44,32 +50,32 @@ def fetch_completed_games(year: int, season_type: str = "regular") -> pd.DataFra
 
     cols = list(raw.columns)
 
-    id_col = _pick(cols, ["id", "game_id", "gameId"])
-    home_col = _pick(cols, ["home_team", "home", "homeName"])
-    away_col = _pick(cols, ["away_team", "away", "awayName"])
-    hp_col = _pick(cols, ["home_points", "home_score", "HomePoints"])
-    ap_col = _pick(cols, ["away_points", "away_score", "AwayPoints"])
+    # Accept both snake_case and camelCase
+    id_col   = _pick(cols, ["id", "game_id", "gameId"])
+    home_col = _pick(cols, ["home_team", "home", "homeName", "homeTeam"])
+    away_col = _pick(cols, ["away_team", "away", "awayName", "awayTeam"])
+    hp_col   = _pick(cols, ["home_points", "home_score", "HomePoints", "homePoints"])
+    ap_col   = _pick(cols, ["away_points", "away_score", "AwayPoints", "awayPoints"])
 
     missing = []
-    if not id_col:
-        missing.append("id/game_id")
-    if not home_col:
-        missing.append("home_team/home")
-    if not away_col:
-        missing.append("away_team/away")
-    if not hp_col:
-        missing.append("home_points/home_score")
-    if not ap_col:
-        missing.append("away_points/away_score")
+    if not id_col:   missing.append("id/game_id")
+    if not home_col: missing.append("home_team/home/homeTeam")
+    if not away_col: missing.append("away_team/away/awayTeam")
+    if not hp_col:   missing.append("home_points/home_score")
+    if not ap_col:   missing.append("away_points/away_score")
 
     if missing:
-        raise ValueError(f"CFBD /games missing expected columns: {missing}")
+        # Help debug by printing available columns
+        raise ValueError(
+            f"CFBD /games missing expected columns: {missing}\n"
+            f"Available columns: {cols}"
+        )
 
     out = pd.DataFrame(
         {
-            "game_id": raw[id_col],
-            "home": raw[home_col],
-            "away": raw[away_col],
+            "game_id":     raw[id_col],
+            "home":        raw[home_col],
+            "away":        raw[away_col],
             "home_points": raw[hp_col],
             "away_points": raw[ap_col],
         }
@@ -97,8 +103,12 @@ def _save_labels(df: pd.DataFrame) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=datetime.utcnow().year)
-    parser.add_argument("--season-type", type=str, default="regular",
-                        help="regular|postseason|both (CFBD seasonType)")
+    parser.add_argument(
+        "--season-type",
+        type=str,
+        default="regular",
+        help="regular|postseason|both (CFBD seasonType)",
+    )
     args = parser.parse_args()
 
     df = fetch_completed_games(args.year, args.season_type)
