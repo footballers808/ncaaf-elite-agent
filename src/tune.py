@@ -1,6 +1,6 @@
 # src/tune.py
-import os, json, yaml, pathlib, shutil, time, subprocess, sys
-from typing import Dict, Any
+import os, json, yaml, pathlib, shutil, time, subprocess, sys, glob
+from typing import Dict, Any, Optional
 import optuna
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -9,7 +9,8 @@ OUT_DIR = ROOT / "tuning-results"
 BEST_CFG = OUT_DIR / "best_config.yaml"
 TRIALS_CSV = OUT_DIR / "trials.csv"
 ARTIFACTS_DIR = ROOT / "artifacts"
-BACKTEST_JSON = ARTIFACTS_DIR / "backtest.json"
+# We'll pass a DIRECTORY to your CLI:
+BACKTEST_OUT_DIR = ARTIFACTS_DIR / "backtest_out"
 
 SEARCH_SPACE = {
     ("train","learning_rate"): ("loguniform", 1e-4, 5e-2),
@@ -55,23 +56,70 @@ def build_cfg_from_trial(base_cfg: Dict[str, Any], trial) -> Dict[str, Any]:
     cfg.setdefault("eval", {}).setdefault("split", "temporal")
     return cfg
 
+def _new_json_since(before: set[pathlib.Path]) -> Optional[pathlib.Path]:
+    # Prefer files with "backtest" in the name
+    candidates = []
+    for p in ARTIFACTS_DIR.rglob("*.json"):
+        if p not in before:
+            candidates.append(p)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in candidates:
+        if "backtest" in p.name.lower():
+            return p
+    return candidates[0]
+
+def _parse_json_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
+    # Try the last {...} block
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if ln.startswith("{") and ln.endswith("}"):
+            try:
+                return json.loads(ln)
+            except Exception:
+                pass
+    return None
+
 def run_backtest() -> Dict[str, Any]:
-    BACKTEST_JSON.parent.mkdir(parents=True, exist_ok=True)
-    if BACKTEST_JSON.exists():
-        BACKTEST_JSON.unlink()
-    # ✅ Use ONLY the args your backtest supports
-    cmd = [sys.executable, "-m", "src.backtest", "--years", "5", "--out", str(BACKTEST_JSON)]
-    r = subprocess.run(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    print(r.stdout)
-    if r.returncode != 0:
+    # Clean previous OUT dir
+    if BACKTEST_OUT_DIR.exists():
+        if BACKTEST_OUT_DIR.is_dir():
+            shutil.rmtree(BACKTEST_OUT_DIR)
+        else:
+            BACKTEST_OUT_DIR.unlink()
+    BACKTEST_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    before = set(ARTIFACTS_DIR.rglob("*.json"))
+
+    # Use only supported args: your CLI shows "--years", optional "--season-type/--carry", and "--out"
+    cmd = [sys.executable, "-m", "src.backtest", "--years", "5", "--out", str(BACKTEST_OUT_DIR)]
+    proc = subprocess.run(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(proc.stdout)
+
+    if proc.returncode != 0:
         raise RuntimeError("backtest command failed")
-    if not BACKTEST_JSON.exists():
-        raise FileNotFoundError(f"{BACKTEST_JSON} not produced by backtest")
-    with open(BACKTEST_JSON, "r", encoding="utf-8") as f:
+
+    # Locate a new JSON result
+    p = _new_json_since(before)
+    if p is None:
+        # Try inside the specific out dir
+        inside = list(BACKTEST_OUT_DIR.rglob("*.json"))
+        if inside:
+            p = max(inside, key=lambda x: x.stat().st_mtime)
+
+    if p is None:
+        # Last resort: parse stdout for a JSON line
+        parsed = _parse_json_from_stdout(proc.stdout)
+        if parsed is not None:
+            return parsed
+        raise FileNotFoundError("No backtest JSON found in artifacts/ or stdout.")
+
+    with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def objective_from_metrics(metrics: Dict[str, Any]) -> float:
-    # Prefer logloss; else minimize inverse Sharpe as fallback
     if "logloss" in metrics and isinstance(metrics["logloss"], (int, float)):
         return float(metrics["logloss"])
     sharpe = float(metrics.get("sharpe", 0.0))
@@ -111,7 +159,6 @@ def main():
         value = objective_from_metrics(metrics)
         dt = time.time() - t0
 
-        # Log simple CSV (pandas optional)
         row = {"trial": trial.number, "value": float(value), "seconds": dt}
         for path in SEARCH_SPACE:
             d = cfg
@@ -122,23 +169,23 @@ def main():
             if isinstance(v, (int, float)):
                 row[k] = float(v)
                 trial.set_user_attr(k, float(v))
+
+        # Write CSV (pandas optional)
         try:
             import pandas as pd
             trial_rows.append(row)
             pd.DataFrame(trial_rows).to_csv(TRIALS_CSV, index=False)
         except Exception:
-            # basic CSV if pandas missing
-            header_needed = not pathlib.Path(TRIALS_CSV).exists()
+            hdr_needed = not pathlib.Path(TRIALS_CSV).exists()
             with open(TRIALS_CSV, "a", encoding="utf-8") as f:
-                if header_needed:
+                if hdr_needed:
                     f.write(",".join(row.keys()) + "\n")
                 f.write(",".join(str(row[k]) for k in row.keys()) + "\n")
-
         return value
 
     study.optimize(objective, n_trials=iters, gc_after_trial=True)
 
-    # Rebuild best config
+    # Rebuild best config from winning params
     best = study.best_trial
     best_cfg = yaml.safe_load(yaml.dump(base_cfg))
     for i, path in enumerate(SEARCH_SPACE.keys()):
