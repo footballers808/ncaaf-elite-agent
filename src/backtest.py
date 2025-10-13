@@ -18,7 +18,6 @@ from .model import (
 from .model import _headers as _cfbd_headers  # CFBD auth header helper (private but safe)
 from .labeler import _pick as _pick_col       # robust col picking
 
-
 CFBD = "https://api.collegefootballdata.com"
 
 
@@ -178,7 +177,10 @@ def simulate_year(year: int, cfg: Dict[str, Any], carry_model: Optional[pd.DataF
     cfg["season_year"] = int(year)
 
     # model (team powers) at season start
-    team_tbl = carry_model.copy() if (carry_model is not None and not carry_model.empty) else _init_team_power()
+    if isinstance(carry_model, pd.DataFrame) and not carry_model.empty:
+        team_tbl = carry_model.copy()
+    else:
+        team_tbl = _init_team_power()
 
     # fetch season games + market
     games = fetch_season_games(year, cfg.get("backtest_season_type","regular"))
@@ -255,15 +257,14 @@ def simulate_year(year: int, cfg: Dict[str, Any], carry_model: Optional[pd.DataF
             df["actual_total"] = df["home_points"] + df["away_points"]
             met["MAE_total"] = float((df["pred_total"] - df["actual_total"]).abs().mean())
 
-        # ATS win% using market spread (closing) if available
+        # ATS agreement using market spread (if available)
         if "pred_spread" in df and df["mkt_spread"].notna().any():
-            # bet home if model_spread < market_spread by threshold? For ATS win% we can measure sign agreement
             preds = np.sign(df["pred_spread"] - df["mkt_spread"].fillna(0))
             outcomes = np.sign(df["actual_margin"] - df["mkt_spread"].fillna(0))
             valid = (df["mkt_spread"].notna())
             met["ATS_agreement_rate"] = float((preds[valid] == outcomes[valid]).mean())
 
-        # simple ROI with flat 1u per edge over threshold (default tiers[0])
+        # simple ROI with flat 1u per edge over threshold (uses first tier)
         tiers = (cfg.get("edge_tiers") or {})
         th_spread = (tiers.get("spread") or [1.5, 2.5, 4.0])[0]
         th_total  = (tiers.get("total")  or [2.0, 3.0, 4.5])[0]
@@ -273,7 +274,6 @@ def simulate_year(year: int, cfg: Dict[str, Any], carry_model: Optional[pd.DataF
         if "edge_spread" in df and df["mkt_spread"].notna().any():
             take = df["edge_spread"].abs() >= th_spread
             for _, r in df[take & df["mkt_spread"].notna()].iterrows():
-                # unit on the direction model favors (home - if model more negative than market)
                 model_pick_home = (r["pred_spread"] < r["mkt_spread"])
                 covered = (r["actual_margin"] < r["mkt_spread"]) if model_pick_home else (r["actual_margin"] > r["mkt_spread"])
                 roi_u += 1.0 if covered else -1.1   # assume -110 vig
@@ -293,14 +293,14 @@ def backtest(cfg: Dict[str, Any], years: List[int], season_type: str, carry_acro
     metrics_per_year: Dict[int, Dict[str, float]] = {}
 
     for y in years:
-        df, met, model_at_end = simulate_year(y, {**cfg, "backtest_season_type": season_type},
-                                              carry_across_seasons and model_at_end)
+        # FIX: pass None when not carrying across seasons (instead of False)
+        carry_model = model_at_end if carry_across_seasons else None
+        df, met, model_at_end = simulate_year(y, {**cfg, "backtest_season_type": season_type}, carry_model)
         results.append(df.assign(season=y))
         metrics_per_year[y] = met
         print(f"[{y}] {met}")
 
     all_df = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    # weighted / overall metrics
     overall = {}
     if not all_df.empty:
         if "pred_spread" in all_df:
