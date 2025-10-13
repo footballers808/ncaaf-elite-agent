@@ -1,7 +1,7 @@
 # src/tune.py
-import os, json, yaml, pathlib, shutil, time, subprocess, sys, glob
+import os, json, yaml, pathlib, shutil, time, subprocess, sys
 from typing import Dict, Any, Optional
-import optuna
+import optuna, random
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CFG_PATH = ROOT / "config.yaml"
@@ -9,7 +9,6 @@ OUT_DIR = ROOT / "tuning-results"
 BEST_CFG = OUT_DIR / "best_config.yaml"
 TRIALS_CSV = OUT_DIR / "trials.csv"
 ARTIFACTS_DIR = ROOT / "artifacts"
-# We'll pass a DIRECTORY to your CLI:
 BACKTEST_OUT_DIR = ARTIFACTS_DIR / "backtest_out"
 
 SEARCH_SPACE = {
@@ -50,20 +49,15 @@ def _s(trial, spec):
     raise ValueError(kind)
 
 def build_cfg_from_trial(base_cfg: Dict[str, Any], trial) -> Dict[str, Any]:
-    cfg = yaml.safe_load(yaml.dump(base_cfg))  # deep copy
+    cfg = yaml.safe_load(yaml.dump(base_cfg))
     for path, spec in SEARCH_SPACE.items():
         set_nested(cfg, path, _s(trial, spec))
     cfg.setdefault("eval", {}).setdefault("split", "temporal")
     return cfg
 
 def _new_json_since(before: set[pathlib.Path]) -> Optional[pathlib.Path]:
-    # Prefer files with "backtest" in the name
-    candidates = []
-    for p in ARTIFACTS_DIR.rglob("*.json"):
-        if p not in before:
-            candidates.append(p)
-    if not candidates:
-        return None
+    candidates = [p for p in ARTIFACTS_DIR.rglob("*.json") if p not in before]
+    if not candidates: return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     for p in candidates:
         if "backtest" in p.name.lower():
@@ -71,7 +65,6 @@ def _new_json_since(before: set[pathlib.Path]) -> Optional[pathlib.Path]:
     return candidates[0]
 
 def _parse_json_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
-    # Try the last {...} block
     lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
     for ln in reversed(lines):
         if ln.startswith("{") and ln.endswith("}"):
@@ -82,7 +75,6 @@ def _parse_json_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
     return None
 
 def run_backtest() -> Dict[str, Any]:
-    # Clean previous OUT dir
     if BACKTEST_OUT_DIR.exists():
         if BACKTEST_OUT_DIR.is_dir():
             shutil.rmtree(BACKTEST_OUT_DIR)
@@ -93,29 +85,31 @@ def run_backtest() -> Dict[str, Any]:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     before = set(ARTIFACTS_DIR.rglob("*.json"))
 
-    # Use only supported args: your CLI shows "--years", optional "--season-type/--carry", and "--out"
     cmd = [sys.executable, "-m", "src.backtest", "--years", "5", "--out", str(BACKTEST_OUT_DIR)]
-    proc = subprocess.run(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    print(proc.stdout)
+    # Simple retry/backoff for 429s bubbled from your backtest
+    attempt, max_attempts = 1, 5
+    while True:
+        proc = subprocess.run(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(proc.stdout)
+        if proc.returncode == 0:
+            break
+        if attempt >= max_attempts:
+            raise RuntimeError("backtest command failed")
+        sleep_s = min(30, 2 ** attempt) + random.uniform(0.0, 0.5)
+        print(f"Backtest failed; retrying in {sleep_s:.1f}s (attempt {attempt}/{max_attempts})")
+        time.sleep(sleep_s)
+        attempt += 1
 
-    if proc.returncode != 0:
-        raise RuntimeError("backtest command failed")
-
-    # Locate a new JSON result
     p = _new_json_since(before)
     if p is None:
-        # Try inside the specific out dir
         inside = list(BACKTEST_OUT_DIR.rglob("*.json"))
         if inside:
             p = max(inside, key=lambda x: x.stat().st_mtime)
-
     if p is None:
-        # Last resort: parse stdout for a JSON line
         parsed = _parse_json_from_stdout(proc.stdout)
         if parsed is not None:
             return parsed
         raise FileNotFoundError("No backtest JSON found in artifacts/ or stdout.")
-
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -128,8 +122,6 @@ def objective_from_metrics(metrics: Dict[str, Any]) -> float:
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     base_cfg = load_yaml(CFG_PATH)
-
-    # Keep pristine base; restore after each trial
     base_copy = ROOT / "config.base.yaml"
     shutil.copyfile(CFG_PATH, base_copy)
 
@@ -139,11 +131,11 @@ def main():
         direction="minimize",
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=8),
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=6),
     )
 
     trial_rows = []
-    iters = int(os.environ.get("TUNE_ITERS", "60"))
+    iters = int(os.environ.get("TUNE_ITERS", "8"))  # small by default
 
     def objective(trial):
         cfg = build_cfg_from_trial(base_cfg, trial)
@@ -156,6 +148,7 @@ def main():
             metrics = run_backtest()
         finally:
             shutil.copyfile(base_copy, CFG_PATH)
+
         value = objective_from_metrics(metrics)
         dt = time.time() - t0
 
@@ -170,7 +163,6 @@ def main():
                 row[k] = float(v)
                 trial.set_user_attr(k, float(v))
 
-        # Write CSV (pandas optional)
         try:
             import pandas as pd
             trial_rows.append(row)
@@ -181,11 +173,13 @@ def main():
                 if hdr_needed:
                     f.write(",".join(row.keys()) + "\n")
                 f.write(",".join(str(row[k]) for k in row.keys()) + "\n")
+
+        # small pause between trials to respect CFBD limits
+        time.sleep(2.0)
         return value
 
     study.optimize(objective, n_trials=iters, gc_after_trial=True)
 
-    # Rebuild best config from winning params
     best = study.best_trial
     best_cfg = yaml.safe_load(yaml.dump(base_cfg))
     for i, path in enumerate(SEARCH_SPACE.keys()):
