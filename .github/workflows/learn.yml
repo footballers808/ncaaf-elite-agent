@@ -1,43 +1,70 @@
 name: Learn Loop
 
 on:
+  # run manually or nightly after games finish
   schedule:
-    - cron: '0 9 * * *'   # runs daily at 09:00 UTC
+    - cron: '30 07 * * *'   # 07:30 UTC daily (adjust as you like)
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   learn:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install deps
         run: pip install -r requirements.txt
 
+      # === Bring in yesterday's predictions (edges + predictions) ===
+      # This downloads the latest successful artifact named `predictions_bundle`
+      # from the workflow file `.github/workflows/main.yml` on branch `main`.
+      - name: Download latest predictions artifact
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: main.yml
+          workflow_conclusion: success
+          name: predictions_bundle
+          branch: main
+          path: .
+
+      - name: Sanity check downloaded files
+        run: |
+          echo "== repo root =="
+          ls -la
+          echo "== output directory =="
+          ls -la output || true
+          echo "== show edges files =="
+          ls -la output/edges_*.csv || echo "No edges_* found!"
+
+      # === Build labels of completed games (needs CFBD API key) ===
       - name: Label completed games
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-        run: python -m src.labeler --year $(date +'%Y')
+        run: |
+          python -m src.labeler --year $(date +%Y)
 
+      # === Evaluate metrics from the downloaded edges ===
       - name: Evaluate metrics
         run: python -m src.metrics
 
-      - name: Train calibration
-        run: python -m src.train
-
+      # === Upload results from learn phase ===
       - name: Upload learn artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: learn_artifacts
           path: |
-            store/labels.parquet
-            store/metrics.jsonl
-            store/metrics_latest.json
-            store/calibration.json
+            store/*.parquet
+            store/*.json
+            output/edges_*.csv
           if-no-files-found: ignore
-
