@@ -1,0 +1,85 @@
+# src/exact_score.py
+from __future__ import annotations
+import os, glob
+import numpy as np
+import pandas as pd
+from scipy.stats import multivariate_normal
+
+# basic football-like variance and correlation
+SIG_HOME = 14.0
+SIG_AWAY = 14.0
+RHO = 0.45
+N_SIMS = 50000
+
+def _latest_edges() -> str:
+    files = sorted(glob.glob("output/edges_*.csv"))
+    if not files:
+        raise FileNotFoundError("No edges CSV found in output/edges_*.csv")
+    return files[-1]
+
+def simulate_game(mu_home: float, mu_away: float,
+                  sig_home: float = SIG_HOME,
+                  sig_away: float = SIG_AWAY,
+                  rho: float = RHO,
+                  n: int = N_SIMS) -> pd.DataFrame:
+    cov = [[sig_home**2, rho*sig_home*sig_away],
+           [rho*sig_home*sig_away, sig_away**2]]
+    mvn = multivariate_normal([mu_home, mu_away], cov)
+    sims = mvn.rvs(size=n)
+    sims = np.clip(np.rint(sims), 0, 90)  # integer points, 0..90 bound
+    df = pd.DataFrame(sims, columns=["home_score","away_score"])
+    return df
+
+def _nudge_to_key_numbers(df: pd.DataFrame) -> pd.DataFrame:
+    # nudge to NFL/NCAAF key totals to look less Gaussian
+    keys = [3,7,10,13,14,17,20,21,24,27,28,31,34,35,38,41,44,47,48,51,55]
+    def adj(x):
+        for k in keys:
+            if abs(x - k) <= 1:
+                return k
+        return x
+    df["home_score"] = df["home_score"].apply(adj)
+    df["away_score"] = df["away_score"].apply(adj)
+    return df
+
+def predict_exact_scores(row: pd.Series) -> pd.DataFrame:
+    # Convert model spread/total to home/away means
+    m_spread = float(row["model_spread"])
+    m_total  = float(row["model_total"])
+    mu_home = (m_total / 2.0) + (m_spread / 2.0)
+    mu_away = (m_total / 2.0) - (m_spread / 2.0)
+
+    sims = simulate_game(mu_home, mu_away)
+    sims = _nudge_to_key_numbers(sims)
+    probs = sims.value_counts(normalize=True).reset_index(name="prob")
+    probs["home"] = row["home"]
+    probs["away"] = row["away"]
+    probs = probs.rename(columns={"home_score":"home","away_score":"away"})
+    probs = probs.sort_values("prob", ascending=False).head(20)
+    return probs[["home","away","home","away","prob"]]  # temp cols to reorder later
+
+def run():
+    edges_path = _latest_edges()
+    edges = pd.read_csv(edges_path)
+    need = {"home","away","model_spread","model_total"}
+    if not need.issubset(edges.columns):
+        raise ValueError(f"{edges_path} missing columns {need - set(edges.columns)}")
+
+    out_rows = []
+    for _, r in edges.iterrows():
+        probs = predict_exact_scores(r)
+        probs.insert(0, "away_team", r["away"])
+        probs.insert(0, "home_team", r["home"])
+        out_rows.append(probs)
+
+    out = pd.concat(out_rows, ignore_index=True)
+    out = out.rename(columns={"home.1":"home_score","away.1":"away_score"}) if "home.1" in out.columns else out
+    out = out.rename(columns={"home":"home_score","away":"away_score"})  # in case of rename above
+
+    os.makedirs("output", exist_ok=True)
+    out_path = os.path.join("output", "exact_scores.csv")
+    out.to_csv(out_path, index=False)
+    print(f"✅ Wrote {out_path} (rows={len(out)})")
+
+if __name__ == "__main__":
+    run()
