@@ -1,4 +1,4 @@
-report:
+odds:
   enabled: true
-  min_games_for_report: 5
-  to: ["YOUR_REAL_INBOX"]
+  # If present in CFBD /lines, we’ll only average across these; else we use all available.
+  preferred_providers: ["DraftKings", "FanDuel", "Caesars", "BetMGM"]
