@@ -30,17 +30,66 @@ jobs:
           EMAIL_TO:     ${{ secrets.EMAIL_TO }}
         run: python main.py
 
-      # If your code wrote predictions.csv to ./output/, copy it up one level
-      - name: Normalize predictions.csv location (optional)
+      # ---- OPTIONAL/HELPER: make sure we end up with a predictions.csv the rest can read ----
+      # 1) If your code wrote output/predictions.csv, copy it up one level
+      - name: Normalize predictions.csv location (quick copy)
         run: |
+          set -e
+          mkdir -p output
           if [ ! -f "predictions.csv" ] && [ -f "output/predictions.csv" ]; then
             cp output/predictions.csv predictions.csv
+            echo "Copied output/predictions.csv -> predictions.csv"
           fi
-          echo "Listing files for sanity:"
+          echo "Listing repo root:"
           ls -la
-          echo "Listing output/:"
+          echo "Listing ./output:"
           ls -la output || true
 
+      # 2) If predictions.csv STILL missing, auto-detect the best CSV in output/ and promote it.
+      - name: Ensure predictions.csv exists (auto-detect)
+        run: |
+          set -e
+          if [ -f "predictions.csv" ]; then
+            echo "predictions.csv already present."
+            exit 0
+          fi
+          python - << 'PY'
+          import os, glob, sys
+          import pandas as pd
+
+          REQUIRED_ANY = {"game_id","id","gameId"}  # any one acceptable; we normalize later
+          MODEL_ANY    = {"model_spread","pred_spread","spread_pred","modelSpread"}
+          TOTAL_ANY    = {"model_total","pred_total","total_pred","modelTotal"}
+          TEAM_ANY     = {"home","home_team","Home"}
+          TEAM_ANY2    = {"away","away_team","Away"}
+
+          candidates = sorted(glob.glob("output/*.csv"))
+          best = None
+          for path in reversed(candidates):  # prefer newest
+              try:
+                  df = pd.read_csv(path, nrows=50)
+              except Exception:
+                  continue
+              cols = set(df.columns)
+              has_id    = len(REQUIRED_ANY & cols) > 0
+              has_sp    = len(MODEL_ANY    & cols) > 0
+              has_tot   = len(TOTAL_ANY    & cols) > 0
+              has_home  = len(TEAM_ANY     & cols) > 0
+              has_away  = len(TEAM_ANY2    & cols) > 0
+              if has_id and has_sp and has_tot and has_home and has_away:
+                  best = path
+                  break
+          if best is None:
+              print("No suitable CSV found in output/ with id/home/away/model_spread/ model_total (or variants).", file=sys.stderr)
+              sys.exit(1)
+
+          # promote to predictions.csv
+          import shutil
+          shutil.copy(best, "predictions.csv")
+          print(f"Promoted {best} -> predictions.csv")
+          PY
+
+      # ---------- Standardize to edges + Exact Score ----------
       - name: Build edges CSV (standardize predictions)
         run: python -m src.make_edges
 
