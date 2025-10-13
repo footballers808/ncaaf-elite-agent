@@ -7,8 +7,12 @@ CFBD = "https://api.collegefootballdata.com"
 CACHE_DIR = pathlib.Path(".cache/cfbd")
 CACHE_TTL_SECS = 7 * 24 * 3600  # 7 days
 
-def _headers() -> Dict[str,str]:
-    key = os.environ.get("CFBD_API_KEY","")
+# Use a dedicated session so monkey-patched requests.get won't intercept us.
+# (requests_cached only replaces requests.get, not Session().get)
+_SESSION = requests.Session()
+
+def _headers() -> Dict[str, str]:
+    key = os.environ.get("CFBD_API_KEY", "")
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 def _key(url: str, params: Optional[Dict[str, Any]]) -> pathlib.Path:
@@ -19,8 +23,8 @@ def _key(url: str, params: Optional[Dict[str, Any]]) -> pathlib.Path:
 
 def cfbd_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 5) -> Any:
     """
-    Cached+retry GET for CFBD.
-    path may be '/teams/fbs' or a full 'https://api.collegefootballdata.com/teams/fbs'
+    GET wrapper with on-disk cache + exponential backoff.
+    path can be '/teams/fbs' or full 'https://api.collegefootballdata.com/teams/fbs'
     """
     url = path if path.startswith("http") else f"{CFBD}{path}"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -32,14 +36,16 @@ def cfbd_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
 
     attempt = 0
     while True:
-        r = requests.get(url, params=params or {}, headers=_headers(), timeout=30)
+        r = _SESSION.get(url, params=params or {}, headers=_headers(), timeout=30)
         if r.status_code == 200:
             data = r.json()
             fp.write_text(json.dumps(data), encoding="utf-8")
             return data
+
         if r.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
             attempt += 1
             sleep_s = min(30, 2 ** attempt) + random.uniform(0.0, 0.5)
             time.sleep(sleep_s)
             continue
+
         r.raise_for_status()
