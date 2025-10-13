@@ -12,7 +12,6 @@ Lightweight NCAAF backtester.
 import argparse
 import json
 import math
-import os
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -130,7 +129,6 @@ def run_backtest(years: int, season_type: str, carry_model: bool, cfg: Dict[str,
     - Computes classification metrics
     - 'carry_model' is accepted for interface parity; noop in this baseline
     """
-    # Resolve which years to pull
     from datetime import datetime
     this_year = datetime.utcnow().year
     yrs = list(range(this_year - years + 1, this_year + 1))
@@ -145,7 +143,6 @@ def run_backtest(years: int, season_type: str, carry_model: bool, cfg: Dict[str,
         labels: List[int] = []
 
         for g in games:
-            # CFBD schema: home_points, away_points (may be None if not played)
             hp = g.get("home_points")
             ap = g.get("away_points")
             if hp is None or ap is None:
