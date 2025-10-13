@@ -3,7 +3,7 @@ name: ncaaf-elite-agent
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 12 * * *"   # 12:15 UTC daily (05:15 America/Phoenix during MST)
+    - cron: "15 12 * * *"   # 12:15 UTC daily (≈ 05:15 America/Phoenix)
 
 jobs:
   run:
