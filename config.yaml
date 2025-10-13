@@ -29,3 +29,10 @@ hfa_points: 2.0
 min_total_floor: 36.0
 max_total_cap: 78.0
 sigma_points: 13.0
+
+# How the total is split between teams (exact score)
+score_split_w_offense: 0.55
+score_split_w_defense: 0.35
+score_split_w_pace:    0.10
+score_split_gain:      0.03   # ↑ makes the split more extreme; ↓ makes it closer to 50/50
+
