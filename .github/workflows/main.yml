@@ -149,3 +149,20 @@ jobs:
           subject: "NCAAF Agent – ${{ github.event.inputs.mode }} – run ${{ github.run_id }}"
           from: ${{ env.FROM_ADDR }}
           to: ${{ env.TO_ADDRS }}
+          content_type: text/html
+          convert_markdown: false
+          attachments: |
+            artifacts/report.html
+            artifacts/edges.csv
+            artifacts/predictions.csv
+
+      - name: Slack webhook
+        if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
+        run: |
+          if [ -f artifacts/edges.csv ]; then
+            MSG="Edges ready for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
+          else
+            MSG="No edges.csv found for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
+          fi
+          curl -X POST -H "Content-type: application/json" \
+            --data "{\"text\":\"${MSG}\"}" "$SLACK_WEBHOOK"
