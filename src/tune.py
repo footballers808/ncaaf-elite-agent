@@ -1,7 +1,7 @@
 # src/tune.py
-import os, json, yaml, pathlib, shutil, time, subprocess, sys
+import os, json, yaml, pathlib, shutil, time, subprocess, sys, random, textwrap
 from typing import Dict, Any, Optional
-import optuna, random
+import optuna
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CFG_PATH = ROOT / "config.yaml"
@@ -10,6 +10,9 @@ BEST_CFG = OUT_DIR / "best_config.yaml"
 TRIALS_CSV = OUT_DIR / "trials.csv"
 ARTIFACTS_DIR = ROOT / "artifacts"
 BACKTEST_OUT_DIR = ARTIFACTS_DIR / "backtest_out"
+
+# If set to "1", we will return neutral metrics on repeated backtest failure
+FAIL_OPEN = os.environ.get("TUNE_FAIL_OPEN", "0") == "1"
 
 SEARCH_SPACE = {
     ("train","learning_rate"): ("loguniform", 1e-4, 5e-2),
@@ -55,68 +58,70 @@ def build_cfg_from_trial(base_cfg: Dict[str, Any], trial) -> Dict[str, Any]:
     cfg.setdefault("eval", {}).setdefault("split", "temporal")
     return cfg
 
-def _new_json_since(before: set[pathlib.Path]) -> Optional[pathlib.Path]:
-    candidates = [p for p in ARTIFACTS_DIR.rglob("*.json") if p not in before]
-    if not candidates: return None
+def _tail(s: str, n: int = 200) -> str:
+    lines = [ln for ln in s.splitlines() if ln.strip() != ""]
+    return "\n".join(lines[-n:])
+
+def _find_new_json(snap_before: set[pathlib.Path]) -> Optional[pathlib.Path]:
+    candidates = [p for p in ARTIFACTS_DIR.rglob("*.json") if p not in snap_before]
+    if not candidates:
+        return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     for p in candidates:
         if "backtest" in p.name.lower():
             return p
     return candidates[0]
 
-def _parse_json_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
-    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-    for ln in reversed(lines):
-        if ln.startswith("{") and ln.endswith("}"):
-            try:
-                return json.loads(ln)
-            except Exception:
-                pass
-    return None
-
 def run_backtest() -> Dict[str, Any]:
+    # Clean output dir
     if BACKTEST_OUT_DIR.exists():
         if BACKTEST_OUT_DIR.is_dir():
             shutil.rmtree(BACKTEST_OUT_DIR)
         else:
             BACKTEST_OUT_DIR.unlink()
     BACKTEST_OUT_DIR.mkdir(parents=True, exist_ok=True)
-
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
     before = set(ARTIFACTS_DIR.rglob("*.json"))
-
     cmd = [sys.executable, "-m", "src.backtest", "--years", "5", "--out", str(BACKTEST_OUT_DIR)]
-    # Simple retry/backoff for 429s bubbled from your backtest
-    attempt, max_attempts = 1, 5
-    while True:
-        proc = subprocess.run(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        print(proc.stdout)
-        if proc.returncode == 0:
-            break
-        if attempt >= max_attempts:
-            raise RuntimeError("backtest command failed")
-        sleep_s = min(30, 2 ** attempt) + random.uniform(0.0, 0.5)
-        print(f"Backtest failed; retrying in {sleep_s:.1f}s (attempt {attempt}/{max_attempts})")
-        time.sleep(sleep_s)
-        attempt += 1
 
-    p = _new_json_since(before)
-    if p is None:
-        inside = list(BACKTEST_OUT_DIR.rglob("*.json"))
-        if inside:
-            p = max(inside, key=lambda x: x.stat().st_mtime)
-    if p is None:
-        parsed = _parse_json_from_stdout(proc.stdout)
-        if parsed is not None:
-            return parsed
-        raise FileNotFoundError("No backtest JSON found in artifacts/ or stdout.")
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        proc = subprocess.run(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print("\n--- backtest stdout (attempt", attempt, ") ---")
+        print(_tail(proc.stdout, 400))
+        print("--- end backtest stdout ---\n")
+
+        if proc.returncode == 0:
+            p = _find_new_json(before) or max(BACKTEST_OUT_DIR.rglob("*.json"), default=None, key=lambda x: x.stat().st_mtime)
+            if p is None:
+                raise FileNotFoundError("Backtest succeeded but no JSON found in artifacts/")
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        # Non-zero: back off and retry
+        if attempt < max_attempts:
+            sleep_s = min(30, 2 ** attempt) + random.uniform(0, 0.5)
+            print(f"Backtest failed (exit {proc.returncode}); retrying in {sleep_s:.1f}s...")
+            time.sleep(sleep_s)
+
+    # Reached here = all attempts failed
+    msg = "backtest command failed after retries"
+    if FAIL_OPEN:
+        print("WARNING:", msg, "— returning neutral metrics to continue tuning.")
+        return {
+            "overall": {"logloss": 0.693147, "brier": 0.25, "roi": 0.0, "sharpe": 0.0},
+            "failed": True,
+            "note": msg,
+        }
+    raise RuntimeError(msg)
 
 def objective_from_metrics(metrics: Dict[str, Any]) -> float:
-    if "logloss" in metrics and isinstance(metrics["logloss"], (int, float)):
-        return float(metrics["logloss"])
-    sharpe = float(metrics.get("sharpe", 0.0))
+    overall = metrics.get("overall", {})
+    if "logloss" in overall and isinstance(overall["logloss"], (int, float)):
+        return float(overall["logloss"])
+    # Fallback to inverse Sharpe if logloss missing
+    sharpe = float(overall.get("sharpe", 0.0))
     return 1.0 / (abs(sharpe) + 1e-6)
 
 def main():
@@ -134,10 +139,22 @@ def main():
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=6),
     )
 
-    trial_rows = []
-    iters = int(os.environ.get("TUNE_ITERS", "8"))  # small by default
+    # Trial CSV
+    header_written = False
+    iters = int(os.environ.get("TUNE_ITERS", "8"))
+
+    def write_row(row: Dict[str, Any]):
+        nonlocal header_written
+        TRIALS_CSV.parent.mkdir(parents=True, exist_ok=True)
+        if not header_written or not pathlib.Path(TRIALS_CSV).exists():
+            with open(TRIALS_CSV, "w", encoding="utf-8") as f:
+                f.write(",".join(row.keys()) + "\n")
+            header_written = True
+        with open(TRIALS_CSV, "a", encoding="utf-8") as f:
+            f.write(",".join(str(row[k]) for k in row.keys()) + "\n")
 
     def objective(trial):
+        # Build temp config
         cfg = build_cfg_from_trial(base_cfg, trial)
         temp_cfg = ROOT / "config.temp.yaml"
         save_yaml(cfg, temp_cfg)
@@ -148,34 +165,26 @@ def main():
             metrics = run_backtest()
         finally:
             shutil.copyfile(base_copy, CFG_PATH)
-
-        value = objective_from_metrics(metrics)
         dt = time.time() - t0
 
-        row = {"trial": trial.number, "value": float(value), "seconds": dt}
+        overall = metrics.get("overall", {})
+        value = objective_from_metrics(metrics)
+
+        # Flatten config used
+        flat = {"trial": trial.number, "value": float(value), "seconds": round(dt, 3)}
         for path in SEARCH_SPACE:
             d = cfg
             for k in path:
                 d = d[k]
-            row[".".join(path)] = d
-        for k, v in metrics.items():
+            flat[".".join(path)] = d
+        for k, v in overall.items():
             if isinstance(v, (int, float)):
-                row[k] = float(v)
+                flat[k] = float(v)
                 trial.set_user_attr(k, float(v))
+        write_row(flat)
 
-        try:
-            import pandas as pd
-            trial_rows.append(row)
-            pd.DataFrame(trial_rows).to_csv(TRIALS_CSV, index=False)
-        except Exception:
-            hdr_needed = not pathlib.Path(TRIALS_CSV).exists()
-            with open(TRIALS_CSV, "a", encoding="utf-8") as f:
-                if hdr_needed:
-                    f.write(",".join(row.keys()) + "\n")
-                f.write(",".join(str(row[k]) for k in row.keys()) + "\n")
-
-        # small pause between trials to respect CFBD limits
-        time.sleep(2.0)
+        # Gentle pause between trials
+        time.sleep(1.5)
         return value
 
     study.optimize(objective, n_trials=iters, gc_after_trial=True)
