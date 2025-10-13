@@ -1,18 +1,17 @@
-# src/labeler.py
 from __future__ import annotations
 
 import argparse
 import os
-from datetime import datetime
-from typing import Iterable, Optional
+from datetime import datetime, timezone
+from typing import Iterable, Optional, Dict, Any, List
 
 import pandas as pd
 import requests
 
-
 CFBD = "https://api.collegefootballdata.com"
 
 
+# ----------------------- helpers (unchanged) -----------------------
 def _pick(cols: Iterable[str], choices: Iterable[str]) -> Optional[str]:
     """
     Return first matching column (case-insensitive) from `choices`.
@@ -32,6 +31,7 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {api_key}"}
 
 
+# ----------------------- public fetch (your existing logic) -----------------------
 def fetch_completed_games(year: int, season_type: str = "regular") -> pd.DataFrame:
     """
     Pull games for a season; keep only rows that have final scores and
@@ -51,21 +51,25 @@ def fetch_completed_games(year: int, season_type: str = "regular") -> pd.DataFra
     cols = list(raw.columns)
 
     # Accept both snake_case and camelCase
-    id_col   = _pick(cols, ["id", "game_id", "gameId"])
+    id_col = _pick(cols, ["id", "game_id", "gameId"])
     home_col = _pick(cols, ["home_team", "home", "homeName", "homeTeam"])
     away_col = _pick(cols, ["away_team", "away", "awayName", "awayTeam"])
-    hp_col   = _pick(cols, ["home_points", "home_score", "HomePoints", "homePoints"])
-    ap_col   = _pick(cols, ["away_points", "away_score", "AwayPoints", "awayPoints"])
+    hp_col = _pick(cols, ["home_points", "home_score", "HomePoints", "homePoints"])
+    ap_col = _pick(cols, ["away_points", "away_score", "AwayPoints", "awayPoints"])
 
     missing = []
-    if not id_col:   missing.append("id/game_id")
-    if not home_col: missing.append("home_team/home/homeTeam")
-    if not away_col: missing.append("away_team/away/awayTeam")
-    if not hp_col:   missing.append("home_points/home_score")
-    if not ap_col:   missing.append("away_points/away_score")
+    if not id_col:
+        missing.append("id/game_id")
+    if not home_col:
+        missing.append("home_team/home/homeTeam")
+    if not away_col:
+        missing.append("away_team/away/awayTeam")
+    if not hp_col:
+        missing.append("home_points/home_score")
+    if not ap_col:
+        missing.append("away_points/away_score")
 
     if missing:
-        # Help debug by printing available columns
         raise ValueError(
             f"CFBD /games missing expected columns: {missing}\n"
             f"Available columns: {cols}"
@@ -73,9 +77,9 @@ def fetch_completed_games(year: int, season_type: str = "regular") -> pd.DataFra
 
     out = pd.DataFrame(
         {
-            "game_id":     raw[id_col],
-            "home":        raw[home_col],
-            "away":        raw[away_col],
+            "game_id": raw[id_col],
+            "home": raw[home_col],
+            "away": raw[away_col],
             "home_points": raw[hp_col],
             "away_points": raw[ap_col],
         }
@@ -100,7 +104,75 @@ def _save_labels(df: pd.DataFrame) -> str:
     return path
 
 
-def main():
+# ----------------------- NEW: pipeline adapter -----------------------
+def label_latest_results(cfg: Dict[str, Any], predictions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Adapter used by the runner. It fetches completed games for the configured season
+    and (if possible) merges with predictions on gameId to build supervised rows.
+    If predictions don’t include gameId, we still return label rows (no y_true).
+    """
+    try:
+        year = int(cfg.get("season_year") or datetime.now(timezone.utc).year)
+    except Exception:
+        year = datetime.now(timezone.utc).year
+
+    df = fetch_completed_games(year, "regular")
+    if df.empty:
+        print("ℹ️ No completed games available for labeling.")
+        return []
+
+    # Map by game_id for quick join to predictions (which may store key as 'gameId')
+    label_by_id = {int(gid): row for gid, row in df.set_index("game_id").iterrows()}
+    out: List[Dict[str, Any]] = []
+
+    # Try to label the predictions if ids match; otherwise emit label-only rows.
+    matched = 0
+    for p in predictions or []:
+        gid = p.get("gameId") or p.get("game_id")
+        if gid is None:
+            continue
+        try:
+            gid = int(gid)
+        except Exception:
+            continue
+        lab = label_by_id.get(gid)
+        if lab is None:
+            continue
+        matched += 1
+        home_pts = float(lab["home_points"])
+        away_pts = float(lab["away_points"])
+        row = dict(p)  # copy prediction fields
+        row.update(
+            {
+                "y_true": 1 if (home_pts - away_pts) > 0 else 0,  # simple win label (example)
+                "home_points": int(home_pts),
+                "away_points": int(away_pts),
+                # optional regression truth if your model outputs these preds:
+                "spread_true": away_pts - home_pts,  # home negative if home won big
+                "total_true": home_pts + away_pts,
+            }
+        )
+        out.append(row)
+
+    if matched == 0:
+        # Fallback: return label rows only (useful for metrics later), runner will handle empty y_true gracefully
+        for _, r in df.iterrows():
+            out.append(
+                {
+                    "game_id": int(r["game_id"]),
+                    "home": r["home"],
+                    "away": r["away"],
+                    "home_points": int(r["home_points"]),
+                    "away_points": int(r["away_points"]),
+                    # no y_true because we don’t know your exact target when no prediction row exists
+                }
+            )
+    print(f"✅ Built {len(out)} labeled rows (matched {matched} predictions).")
+    return out
+
+
+# ----------------------- CLI (kept for manual use) -----------------------
+def _cli():
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=datetime.utcnow().year)
     parser.add_argument(
@@ -121,4 +193,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _cli()
