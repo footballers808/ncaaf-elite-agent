@@ -1,3 +1,13 @@
+def main():
+    tz_name = CFG.get("timezone", "America/Phoenix")
+    date_iso = today_local_iso(tz_name)
+    year = int(date_iso[:4])
+    api_key = os.environ.get("CFBD_API_KEY","")
+
+    venues_map = build_team_venues_map(year, api_key)
+    slate = cfbd_games_date(date_iso, tzname=tz_name)
+    ...
+    wx_map = enrich_weather_for_games(slate, venues_map, local_tz_name=tz_name)
 import os, yaml
 from src.emailer import send_email_html
 from src.providers import today_local_iso, cfbd_games_date, cfbd_season_stats, cfbd_team_records
