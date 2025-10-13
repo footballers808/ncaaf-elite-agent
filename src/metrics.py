@@ -36,7 +36,8 @@ def evaluate(labels_path: str = os.path.join(STORE, "labels.parquet"),
     df["spread_error"] = df["actual_spread"] - df["model_spread"]
     df["total_error"]  = df["actual_total"] - df["model_total"]
 
-    mae_spread  = float(df["spread_error"].abs().mean())
-    rmse_spread = float((df["spread_error"]**2).mean() ** 0.5)
-    mae_total   = float(df["total_error"].abs().mean())
-    rmse_total  = float((df["total_error"]**2).me**_]()_
+mae_spread  = float(df["spread_error"].abs().mean())
+rmse_spread = float((df["spread_error"]**2).mean() ** 0.5)
+mae_total   = float(df["total_error"].abs().mean())
+rmse_total  = float((df["total_error"]**2).mean() ** 0.5)
+
