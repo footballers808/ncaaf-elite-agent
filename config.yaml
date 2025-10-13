@@ -1,4 +1,8 @@
-report:
+news:
   enabled: true
-  min_games_for_report: 0   # forces the email even if labels are empty
-  to: ["YOUR_EMAIL@domain.com"]
+  # Points added to spread per 1.0 of (home_sentiment - away_sentiment) after capping.
+  sentiment_weight_spread: 0.6
+  # Optional: affect totals too (often keep at 0.0 or very small).
+  sentiment_weight_total: 0.0
+  # Cap applied to the raw sentiment delta before weights, e.g., +/-1.5
+  sentiment_cap: 1.5
