@@ -36,3 +36,11 @@ score_split_w_defense: 0.35
 score_split_w_pace:    0.10
 score_split_gain:      0.03   # ↑ makes the split more extreme; ↓ makes it closer to 50/50
 
+learn:
+  enabled: true
+  k_factor: 0.25        # how fast powers move per game (0.15–0.35 is typical)
+  margin_cap: 24        # cap on point margin used for learning
+  weekly_decay: 0.00    # 0.00 = no decay; try 0.01–0.03 to slowly pull toward 0 each week
+  hfa_points_for_learn: 2.0  # HFA used when computing expected margin
+
+
