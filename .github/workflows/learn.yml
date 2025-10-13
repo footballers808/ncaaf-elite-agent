@@ -9,27 +9,14 @@ jobs:
   learn:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install deps
         run: pip install -r requirements.txt
-
-      - name: Sanity check CFBD key exists
-        env:
-          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-        run: |
-          if [ -z "${CFBD_API_KEY}" ]; then
-            echo "CFBD_API_KEY not present in env"
-            exit 1
-          else
-            echo "CFBD_API_KEY is set"
-          fi
 
       - name: Label completed games
         env:
@@ -42,4 +29,15 @@ jobs:
       - name: Train calibration
         run: python -m src.train
 
-      - name: Upload learn a
+      - name: Upload learn artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: learn_artifacts
+          path: |
+            store/labels.parquet
+            store/metrics.jsonl
+            store/metrics_latest.json
+            store/calibration.json
+          if-no-files-found: ignore
+
