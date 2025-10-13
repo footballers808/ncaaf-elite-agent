@@ -1,3 +1,5 @@
+from src.requests_cached import install_requests_cache
+install_requests_cache()
 from __future__ import annotations
 import os
 import argparse
