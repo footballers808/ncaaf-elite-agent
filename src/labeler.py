@@ -1,4 +1,6 @@
-# src/labeler.py
+api_key = os.environ.get("CFBD_API_KEY")
+headers = {"Authorization": f"Bearer {api_key}"}
+r = requests.get(f"{CFBD}/games", params=params, headers=headers, timeout=60)# src/labeler.py
 from __future__ import annotations
 import os, time, requests, pandas as pd
 from typing import Optional
