@@ -1,174 +1,141 @@
-"""
-main.py — NCAAF Elite Agent Predictor (robust)
-----------------------------------------------
-Fetches schedule from CFBD, normalizes columns, generates model predictions,
-and writes a standardized predictions.csv for downstream steps.
-"""
-
 from __future__ import annotations
-
 import os
-from datetime import datetime
-from typing import Iterable, Optional
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
-import requests
+from .model import train_model, predict_games, save_model, load_model
+from .labeler import label_latest_results
+from .metrics import classification_metrics, regression_metrics
+from .reporter import render_html, to_csv_bytes
+from .mailer import send_email_html
 
-# ===============================
-# CONFIG
-# ===============================
-CFBD_API_KEY = os.environ.get("CFBD_API_KEY")
-if not CFBD_API_KEY:
-    raise EnvironmentError("❌ Missing CFBD_API_KEY in environment secrets.")
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
-CFBD = "https://api.collegefootballdata.com"
-HEADERS = {"Authorization": f"Bearer {CFBD_API_KEY}"}
+def load_config(path: str="config.yaml") -> Dict[str, Any]:
+    if not yaml:
+        raise RuntimeError("pyyaml not installed. Add pyyaml to your requirements.")
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
-OUTPUT_DIR = "output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
+def run() -> int:
+    cfg = load_config()
+    out_dir = cfg.get("output_dir", "outputs")
+    ensure_dir(out_dir)
 
-# ===============================
-# Helpers
-# ===============================
-def pick_col(cols: Iterable[str], choices: Iterable[str]) -> Optional[str]:
-    """Return the first column present from choices (case-insensitive)."""
-    lower = {c.lower(): c for c in cols}
-    for name in choices:
-        if name.lower() in lower:
-            return lower[name.lower()]
-    return None
+    # 1) Predict
+    predictions = predict_games(cfg)
 
+    # 2) Label
+    labeled_rows = label_latest_results(cfg, predictions)
 
-def normalize_games_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of df with standardized columns: game_id, home, away, start_date?."""
-    if df.empty:
-        return df.copy()
+    # 3) Learn
+    model = load_model(cfg)
+    model = train_model(cfg, model, labeled_rows)
+    save_model(cfg, model)
 
-    cols = list(df.columns)  # keep original case
+    # 4) Save CSVs
+    ts_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    pred_csv_path = os.path.join(out_dir, f"predictions_{ts_tag}.csv")
+    labels_csv_path = os.path.join(out_dir, f"labels_{ts_tag}.csv")
 
-    game_id_col = pick_col(cols, ["id", "game_id", "gameid"])
-    home_col    = pick_col(cols, ["home_team", "home", "hometeam", "home_name", "homeTeam"])
-    away_col    = pick_col(cols, ["away_team", "away", "awayteam", "away_name", "awayTeam"])
+    if predictions:
+        import csv
+        with open(pred_csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=sorted({k for r in predictions for k in r.keys()}))
+            w.writeheader()
+            for r in predictions:
+                w.writerow(r)
+    if labeled_rows:
+        import csv
+        with open(labels_csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=sorted({k for r in labeled_rows for k in r.keys()}))
+            w.writeheader()
+            for r in labeled_rows:
+                w.writerow(r)
 
-    # Date can vary a lot; try several possibilities
-    date_col = pick_col(
-        cols,
-        [
-            "start_date",
-            "start_time",
-            "start_time_tbd",
-            "game_date",
-            "kickoff",
-            "start",
-        ],
-    )
+    # ==== REPORTING START =======================================================
+    report_cfg = (cfg.get("report") or {})
+    if report_cfg.get("enabled", True):
+        n_labeled = len([r for r in labeled_rows if r.get("y_true") is not None])
+        if n_labeled >= int(report_cfg.get("min_games_for_report", 5)):
+            y_true_cls = [int(r["y_true"]) for r in labeled_rows if r.get("y_true") is not None and r.get("y_prob") is not None]
+            y_prob_cls = [float(r["y_prob"]) for r in labeled_rows if r.get("y_true") is not None and r.get("y_prob") is not None]
+            cls_m = classification_metrics(y_true_cls, y_prob_cls, threshold=0.5, bins=10) if y_true_cls else None
 
-    out = df.copy()
+            spread_true = [float(r["spread_true"]) for r in labeled_rows if r.get("spread_true") is not None and r.get("spread_pred") is not None]
+            spread_pred = [float(r["spread_pred"]) for r in labeled_rows if r.get("spread_true") is not None and r.get("spread_pred") is not None]
+            total_true  = [float(r["total_true"])  for r in labeled_rows if r.get("total_true")  is not None and r.get("total_pred")  is not None]
+            total_pred  = [float(r["total_pred"])  for r in labeled_rows if r.get("total_true")  is not None and r.get("total_pred")  is not None]
 
-    # Copy/rename when present
-    if game_id_col:
-        out["game_id"] = out[game_id_col]
-    if home_col:
-        out["home"] = out[home_col]
-    if away_col:
-        out["away"] = out[away_col]
-    if date_col:
-        out["start_date"] = pd.to_datetime(out[date_col], errors="coerce")
+            reg_spread = regression_metrics(spread_true, spread_pred) if spread_true else None
+            reg_total  = regression_metrics(total_true, total_pred)   if total_true  else None
 
-    # Keep only what we care about if available
-    keep = [c for c in ["game_id", "home", "away", "start_date", "season", "week"] if c in out.columns]
-    if not keep:
-        return pd.DataFrame()
+            top_k = int(report_cfg.get("top_edges_in_email", 10))
+            edge_rows = []
+            for r in predictions:
+                ev = r.get("edge_value")
+                et = r.get("edge_type")
+                if ev is None or et is None:
+                    continue
+                edge_rows.append({
+                    "matchup": r.get("matchup") or f"{r.get('home_team','?')} vs {r.get('away_team','?')}",
+                    "market_text": r.get("market_text") or "",
+                    "model_text": r.get("model_text") or "",
+                    "edge_text": f"{float(ev):+.2f}",
+                    "edge_type": et,
+                    "edge_abs": abs(float(ev)),
+                })
+            edge_rows.sort(key=lambda x: x["edge_abs"], reverse=True)
+            top_edges = edge_rows[:top_k] if edge_rows else None
 
-    out = out[keep].copy()
+            subject_prefix = report_cfg.get("subject_prefix", "[NCAAF]")
+            subject = f"{subject_prefix} Run {ts_tag} — {n_labeled} labeled games"
+            run_title = f"NCAAF Elite Agent — Run {ts_tag}"
 
-    # Drop rows missing team names
-    if {"home", "away"}.issubset(out.columns):
-        out = out[out["home"].notna() & out["away"].notna()]
+            html = render_html(
+                run_title=run_title,
+                cls_metrics=cls_m,
+                reg_metrics_spread=reg_spread,
+                reg_metrics_total=reg_total,
+                top_edges_table=top_edges
+            )
 
-    return out.reset_index(drop=True)
+            attachments = []
+            if report_cfg.get("attach_predictions_csv", True) and predictions:
+                fields = sorted({k for r in predictions for k in r.keys()})
+                attachments.append((
+                    f"predictions_{ts_tag}.csv",
+                    to_csv_bytes(predictions, fields),
+                    "text/csv"
+                ))
+            if report_cfg.get("attach_edges_csv", True) and edge_rows:
+                fields = ["matchup","market_text","model_text","edge_type","edge_text","edge_abs"]
+                attachments.append((
+                    f"edges_{ts_tag}.csv",
+                    to_csv_bytes(edge_rows, fields),
+                    "text/csv"
+                ))
 
+            to = report_cfg.get("to") or []
+            cc = report_cfg.get("cc") or []
+            bcc = report_cfg.get("bcc") or []
+            if not to:
+                print("⚠️ report.to is empty; skipping email send.")
+            else:
+                send_email_html(subject, html, to=to, cc=cc, bcc=bcc, attachments=attachments)
+                print(f"✅ Sent report email to {to}")
+        else:
+            print(f"ℹ️ Not enough labeled games ({n_labeled}) to send report.")
+    # ==== REPORTING END =========================================================
 
-# ===============================
-# DATA FETCH
-# ===============================
-def fetch_games_any_schema(year: int) -> pd.DataFrame:
-    """Fetch games for the given year and normalize columns safely."""
-    url = f"{CFBD}/games"
-    params = {"year": year, "seasonType": "regular"}
-    print(f"📡 Fetching games for {year} ...")
-
-    r = requests.get(url, params=params, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    raw = pd.DataFrame(r.json())
-
-    if raw.empty:
-        print("⚠️ CFBD returned 0 games.")
-        return raw
-
-    print(f"✅ Retrieved {len(raw)} raw rows from CFBD.")
-    games = normalize_games_cols(raw)
-
-    print(f"✅ Normalized to {len(games)} rows with columns: {list(games.columns)}")
-    return games
-
-
-# ===============================
-# MODEL / PREDICTIONS
-# ===============================
-def generate_predictions(games: pd.DataFrame) -> pd.DataFrame:
-    """Generate placeholder predictions (replace with your model)."""
-    if games.empty:
-        print("⚠️ No games to predict.")
-        return pd.DataFrame()
-
-    if not {"home", "away"}.issubset(games.columns):
-        raise ValueError("❌ Normalized games missing 'home'/'away' columns.")
-
-    df = games.copy()
-
-    # Example placeholder model — replace with your real model
-    df["model_spread"] = (df["home"].astype(str).apply(hash) % 21) - 10  # ~[-10, +10]
-    df["model_total"] = 45 + (df["away"].astype(str).apply(hash) % 21)   # ~[45..65]
-    df["confidence"] = 0.5 + (df["model_spread"].abs() / 25.0)
-
-    print(f"✅ Generated predictions for {len(df)} games.")
-    return df
-
-
-# ===============================
-# OUTPUT WRITER
-# ===============================
-def write_predictions(df: pd.DataFrame) -> str:
-    """
-    Standardize and save predictions.csv
-    Required columns: home, away, model_spread, model_total
-    """
-    if df.empty:
-        raise ValueError("❌ No predictions to write — dataframe is empty.")
-
-    # Ensure required columns exist
-    required = {"home", "away", "model_spread", "model_total"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"❌ Missing required columns for output: {missing}")
-
-    out_path = os.path.join(OUTPUT_DIR, "predictions.csv")
-    df.to_csv(out_path, index=False)
-    print(f"✅ Wrote {out_path} ({len(df)} rows)")
-    return out_path
-
-
-# ===============================
-# MAIN
-# ===============================
-def main():
-    year = datetime.utcnow().year
-    games = fetch_games_any_schema(year)
-    preds = generate_predictions(games)
-    write_predictions(preds)
-
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run())
