@@ -20,7 +20,7 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-           - name: Sanity check CFBD key exists
+      - name: Sanity check CFBD key exists
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
         run: |
@@ -30,3 +30,16 @@ jobs:
           else
             echo "CFBD_API_KEY is set"
           fi
+
+      - name: Label completed games
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+        run: python -m src.labeler --year $(date +'%Y')
+
+      - name: Evaluate metrics
+        run: python -m src.metrics
+
+      - name: Train calibration
+        run: python -m src.train
+
+      - name: Upload learn a
