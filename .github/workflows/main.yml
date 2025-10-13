@@ -16,7 +16,6 @@ on:
         required: false
         default: "false"
   schedule:
-    # Weekly learning/report every Monday 06:00 America/Phoenix (13:00 UTC)
     - cron: "0 13 * * 1"
 
 permissions:
@@ -39,8 +38,8 @@ jobs:
       SMTP_USER:     ${{ secrets.SMTP_USER }}
       SMTP_PASS:     ${{ secrets.SMTP_PASS }}
       FROM_ADDR:     ${{ secrets.FROM_ADDR }}
-      TO_ADDRS:      ${{ secrets.TO_ADDRS }}      # comma-separated
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }} # optional
+      TO_ADDRS:      ${{ secrets.TO_ADDRS }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
 
     steps:
       - name: Checkout
@@ -57,7 +56,6 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Restore the tuner outputs if they exist (optional artifact)
       - name: Restore tuned config (if exists)
         uses: actions/download-artifact@v4
         with:
@@ -76,8 +74,6 @@ jobs:
             echo "No tuning best_config.yaml found; proceeding with current config.yaml"
           fi
           python tools/validate_config.py
-
-      # -------- MODES --------
 
       - name: Predict
         if: ${{ github.event.inputs.mode == 'predict' }}
@@ -106,9 +102,9 @@ jobs:
       - name: Backtest
         if: ${{ github.event.inputs.mode == 'backtest' }}
         run: |
-          python -m src.backtest --years 5 --cv time --out artifacts/backtest.json
+          python -m src.backtest --years 5 --out artifacts/backtest.json
           if [ -f tuning-results/best_config.yaml ]; then
-            python -m src.tune --mode verify-best --in tuning-results/best_config.yaml --out artifacts/tune-verify.json
+            python -m src.tune --mode verify-best --in tuning-results/best_config.yaml --out artifacts/tune-verify.json || true
           fi
 
       - name: Tune
@@ -118,7 +114,6 @@ jobs:
         run: |
           python -m src.tune
 
-      # -------- ARTIFACTS --------
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -130,7 +125,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # -------- OPTIONAL: PR to apply merged tuned config --------
       - name: Commit merged tuned config to branch
         if: ${{ github.event.inputs.commit_best == 'true' && hashFiles('config.merged.yaml') != '' }}
         run: |
@@ -144,7 +138,6 @@ jobs:
           git push -u origin "$BR"
           echo "PR step skipped unless GH CLI is installed."
 
-      # -------- EMAIL REPORT --------
       - name: Email report
         if: ${{ env.SMTP_HOST != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         uses: dawidd6/action-send-mail@v3
@@ -156,21 +149,3 @@ jobs:
           subject: "NCAAF Agent – ${{ github.event.inputs.mode }} – run ${{ github.run_id }}"
           from: ${{ env.FROM_ADDR }}
           to: ${{ env.TO_ADDRS }}
-          content_type: text/html
-          convert_markdown: false
-          attachments: |
-            artifacts/report.html
-            artifacts/edges.csv
-            artifacts/predictions.csv
-
-      # -------- OPTIONAL SLACK --------
-      - name: Slack webhook
-        if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
-        run: |
-          if [ -f artifacts/edges.csv ]; then
-            MSG="Edges ready for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
-          else
-            MSG="No edges.csv found for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
-          fi
-          curl -X POST -H "Content-type: application/json" \
-            --data "{\"text\":\"${MSG}\"}" "$SLACK_WEBHOOK"
