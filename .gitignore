@@ -1,0 +1,40 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.build/
+dist/
+build/
+*.pyo
+*.pyd
+
+# ===== Environments / tooling =====
+.venv/
+venv/
+.env
+.envrc
+.python-version
+pytest.ini
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+
+# ===== Editors / OS =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ===== Project artifacts (kept out of git; Actions will upload them) =====
+artifacts/
+tuning-results/
+reports/
+
+# ===== CFBD HTTP cache (for Option C) =====
+.cache/
+.cache/cfbd/
+
+# ===== Jupyter (if any) =====
+.ipynb_checkpoints/
