@@ -56,10 +56,6 @@ def _write_csv(path: str, rows: List[Dict[str, Any]]):
             w.writerow(r)
 
 def _append_daily_history(rows: List[Dict[str, Any]], ts_utc: datetime, history_dir: str = "history"):
-    """
-    Appends this run's predictions to history/preds_YYYYMMDD.csv (one file per day).
-    Creates the directory if needed, writes header only if file doesn't exist.
-    """
     if not rows:
         return
     ensure_dir(history_dir)
@@ -79,23 +75,12 @@ def _append_daily_history(rows: List[Dict[str, Any]], ts_utc: datetime, history_
 # ------------------------- Edge tiers / stars -------------------------
 
 def _get_edge_thresholds(cfg: Dict[str, Any]) -> Dict[str, List[float]]:
-    """
-    Returns thresholds dict:
-      {"spread":[1.5,2.5,4.0], "total":[2.0,3.0,4.5]}
-    You can override via config:
-      edge_tiers:
-        spread: [1.5, 2.5, 4.0]
-        total:  [2.0, 3.0, 4.5]
-    """
     tiers = (cfg.get("edge_tiers") or {})
     spread = tiers.get("spread") or [1.5, 2.5, 4.0]
     total  = tiers.get("total")  or [2.0, 3.0, 4.5]
     return {"spread": spread, "total": total}
 
 def _stars_for_edge(edge_value: Optional[float], thresholds: List[float]) -> str:
-    """
-    0/1/2/3 stars based on absolute edge and ascending thresholds.
-    """
     if edge_value is None:
         return ""
     try:
@@ -114,18 +99,11 @@ def _stars_for_edge(edge_value: Optional[float], thresholds: List[float]) -> str
     return ""
 
 def _short_rationale(row: Dict[str, Any]) -> str:
-    """
-    Builds a compact rationale string if hints are present.
-    Looks for common keys you already compute; falls back to a generic note.
-    """
     reasons: List[str] = []
-    # Weather
     if row.get("weather_note"):
         reasons.append(f"weather: {row['weather_note']}")
     elif row.get("weather_flag"):
         reasons.append("weather impact")
-
-    # Injuries
     if row.get("injury_note"):
         reasons.append(f"injuries: {row['injury_note']}")
     elif row.get("injury_index") not in (None, "", 0):
@@ -134,40 +112,27 @@ def _short_rationale(row: Dict[str, Any]) -> str:
                 reasons.append("injury edge")
         except Exception:
             pass
-
-    # Matchup / pace / macro
     if row.get("matchup_note"):
         reasons.append(f"matchup: {row['matchup_note']}")
     elif row.get("pace_note"):
         reasons.append(f"pace: {row['pace_note']}")
     elif row.get("macro_note"):
         reasons.append(f"macro: {row['macro_note']}")
-
     if not reasons:
         return "model vs market delta"
-    return "; ".join(reasons[:2])  # keep it short
-
-
-# ------------------------- Reporting glue -------------------------
+    return "; ".join(reasons[:2])
 
 def _build_top_plays(predictions: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Returns rows that have at least one star (spread or total), sorted by abs edge.
-    Each row includes: stars, type, edge_text, matchup, market_text, model_text, rationale.
-    """
     if not predictions:
         return []
-
     tiers = _get_edge_thresholds(cfg)
     out: List[Dict[str, Any]] = []
-
     for r in predictions:
         matchup = r.get("matchup") or f"{r.get('away_team','?')} @ {r.get('home_team','?')}"
         market_text = r.get("market_text", "")
         model_text  = r.get("model_text", "")
         rationale = _short_rationale(r)
 
-        # Case A: a single edge with 'edge_type' + 'edge_value'
         et = r.get("edge_type")
         ev = r.get("edge_value")
         if et in ("spread", "total") and ev is not None:
@@ -184,7 +149,6 @@ def _build_top_plays(predictions: List[Dict[str, Any]], cfg: Dict[str, Any]) -> 
                     "rationale": rationale,
                 })
 
-        # Case B: explicit split edges (edge_spread / edge_total)
         es = r.get("edge_spread")
         etot = r.get("edge_total")
         if es is not None:
@@ -213,14 +177,10 @@ def _build_top_plays(predictions: List[Dict[str, Any]], cfg: Dict[str, Any]) -> 
                     "model_text":  r.get("model_text_total",  model_text),
                     "rationale": rationale,
                 })
-
     out.sort(key=lambda x: (len(x["stars"]), x["edge_abs"]), reverse=True)
     return out
 
 def _health_counts(predictions: List[Dict[str, Any]]) -> Dict[str, int]:
-    """
-    Small observability block for the email.
-    """
     total = len(predictions or [])
     with_market = sum(1 for r in (predictions or []) if r.get("market_text") or r.get("market_text_spread") or r.get("market_text_total"))
     starred = 0
@@ -248,7 +208,6 @@ def _maybe_send_report(cfg: Dict[str, Any], ts_tag: str, predictions: List[Dict[
         print(f"ℹ️ Not enough labeled games ({n_labeled}) to send report.")
         return
 
-    # Classification metrics
     y_true_cls, y_prob_cls = [], []
     for r in labeled_rows:
         yt, yp = r.get("y_true"), r.get("y_prob")
@@ -261,7 +220,6 @@ def _maybe_send_report(cfg: Dict[str, Any], ts_tag: str, predictions: List[Dict[
             pass
     cls_m = classification_metrics(y_true_cls, y_prob_cls, threshold=0.5, bins=10) if (HAVE_METRICS and y_true_cls) else None
 
-    # Regression metrics (optional keys)
     def collect_pair(rows, true_key, pred_key):
         t, p = [], []
         for rr in rows:
@@ -277,7 +235,6 @@ def _maybe_send_report(cfg: Dict[str, Any], ts_tag: str, predictions: List[Dict[
     reg_spread = regression_metrics(spread_t, spread_p) if (HAVE_METRICS and spread_t) else None
     reg_total  = regression_metrics(total_t,  total_p)  if (HAVE_METRICS and total_t)  else None
 
-    # Top Plays + Health
     top_plays = _build_top_plays(predictions, cfg)
     health = _health_counts(predictions)
 
@@ -290,21 +247,15 @@ def _maybe_send_report(cfg: Dict[str, Any], ts_tag: str, predictions: List[Dict[
         cls_metrics=cls_m,
         reg_metrics_spread=reg_spread,
         reg_metrics_total=reg_total,
-        top_edges_table=None,      # keep available if you still use it
-        top_plays=top_plays,       # NEW
-        health=health              # NEW
+        top_edges_table=None,
+        top_plays=top_plays,
+        health=health
     )
 
-    # Attachments
     attachments = []
     if report_cfg.get("attach_predictions_csv", True) and predictions:
         fields = sorted({k for r in predictions for k in r.keys()})
         attachments.append((f"predictions_{ts_tag}.csv", to_csv_bytes(predictions, fields), "text/csv"))
-
-    # Optional: attach a detailed edges CSV if you still build it elsewhere
-    # if report_cfg.get("attach_edges_csv", True) and top_plays:
-    #     fields = ["matchup","edge_type","edge_text","stars","market_text","model_text","rationale","edge_abs"]
-    #     attachments.append((f"top_plays_{ts_tag}.csv", to_csv_bytes(top_plays, fields), "text/csv"))
 
     to = report_cfg.get("to") or []
     cc = report_cfg.get("cc") or []
