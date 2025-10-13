@@ -1,10 +1,4 @@
 report:
   enabled: true
-  min_games_for_report: 0   # <-- forces the report even if no games labeled
-  top_edges_in_email: 10
-  attach_predictions_csv: true
-  attach_edges_csv: false
-  subject_prefix: "[NCAAF Elite Agent]"
-  to: ["YOUR_EMAIL@domain.com"]  # make sure this is your inbox
-  cc: []
-  bcc: []
+  min_games_for_report: 0   # forces the email even if labels are empty
+  to: ["YOUR_EMAIL@domain.com"]
