@@ -26,3 +26,7 @@ matchup_total_scale:  0.03
 # Global caps
 max_spread_adj_component: 3.0
 max_total_adj_component:  6.0
+
+# Market edge settings
+edge_threshold_spread: 1.5    # show star if |model - market| >= this
+edge_threshold_total:  2.0
