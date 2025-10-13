@@ -1,6 +1,6 @@
 # Email reporting (already added previously)
 report:
-  enabled: true              # set false for dry-run; true when ready
+  enabled: false              # set false for dry-run; true when ready
   min_games_for_report: 5
   top_edges_in_email: 10
   attach_predictions_csv: true
