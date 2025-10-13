@@ -20,10 +20,13 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Sanity check CFBD key exists
+           - name: Sanity check CFBD key exists
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
         run: |
           if [ -z "${CFBD_API_KEY}" ]; then
-            echo "❌ CFBD_API_KEY
-
+            echo "CFBD_API_KEY not present in env"
+            exit 1
+          else
+            echo "CFBD_API_KEY is set"
+          fi
