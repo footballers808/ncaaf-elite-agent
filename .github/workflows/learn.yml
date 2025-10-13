@@ -1,3 +1,10 @@
+name: Learn Loop
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # runs daily at 09:00 UTC
+  workflow_dispatch:
+
 jobs:
   label:
     runs-on: ubuntu-latest
@@ -14,6 +21,8 @@ jobs:
         run: python -m src.labeler --year $(date +"%Y")
       - name: Evaluate metrics
         run: python -m src.metrics
+      - name: Train calibration
+        run: python -m src.train
       - name: Upload learn artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -24,4 +33,5 @@ jobs:
             store/games.parquet
             store/metrics.jsonl
             store/metrics_latest.json
+            store/calibration.json
           if-no-files-found: ignore
