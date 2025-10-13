@@ -1,4 +1,31 @@
+# config.yaml
+
+# ---- Reporting & notifications ----
 report:
   enabled: true
   min_games_for_report: 5
-  to: ["YOUR_REAL_INBOX"]
+  to: ["your@email.com"]
+
+# ---- Market odds settings ----
+odds:
+  enabled: true
+  preferred_providers: ["DraftKings", "FanDuel", "Caesars", "BetMGM"]
+
+# ---- News sentiment weighting ----
+news:
+  enabled: true
+  sentiment_weight_spread: 0.6
+  sentiment_weight_total: 0.0
+  sentiment_cap: 1.5
+
+# ---- Edge tier thresholds ----
+edge_tiers:
+  spread: [1.5, 2.5, 4.0]
+  total:  [2.0, 3.0, 4.5]
+
+# ---- Optional model knobs ----
+power_scale: 1.0
+hfa_points: 2.0
+min_total_floor: 36.0
+max_total_cap: 78.0
+sigma_points: 13.0
