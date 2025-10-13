@@ -1,26 +1,21 @@
 name: NCAAF Elite Agent
 
 on:
-  # Scheduled daily run (UTC) – adjust as you like
   schedule:
-    - cron: "15 12 * * *"
-  # Manual trigger with inputs to choose mode
+    - cron: "15 12 * * *"   # daily run (UTC) -> adjust if you want
   workflow_dispatch:
     inputs:
       mode:
-        description: "What to run?"
+        description: "Choose what to run"
         type: choice
-        options:
-          - run        # normal predict → label → learn → report
-          - backtest   # historical simulation
-          - tune       # grid search tuner
+        options: [run, backtest, tune]
         default: run
       years:
-        description: "Backtest years (e.g. 2022,2023). Used when mode=backtest."
+        description: "Years (for backtest/tune). Example: 2022,2023"
         required: false
         default: ""
       season_type:
-        description: "Season type for backtest"
+        description: "Season type (for backtest/tune)"
         type: choice
         options: [regular, postseason, both]
         default: regular
@@ -32,9 +27,7 @@ jobs:
   agent:
     runs-on: ubuntu-latest
     env:
-      # always needed
       CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-      # only used in run mode (mailer picks them up)
       SMTP_HOST: ${{ secrets.SMTP_HOST }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -55,15 +48,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ----------------------------
+      # =======================
       # MODE: run (default)
-      # ----------------------------
+      # =======================
       - name: Run NCAAF Elite Agent
         if: ${{ inputs.mode == 'run' || github.event_name == 'schedule' || github.event_name == 'push' }}
         run: |
-          # Ensure repo root is importable (so 'import main' works)
           export PYTHONPATH="${GITHUB_WORKSPACE}:$PYTHONPATH"
-          # Prefer the package entrypoint that delegates to root main.py
           python -m src.main || python main.py
 
       - name: Upload outputs & history
@@ -80,9 +71,9 @@ jobs:
             store/**/*.parquet
           if-no-files-found: ignore
 
-      # ----------------------------
+      # =======================
       # MODE: backtest
-      # ----------------------------
+      # =======================
       - name: Run backtest
         if: ${{ inputs.mode == 'backtest' }}
         shell: bash
@@ -100,12 +91,20 @@ jobs:
           path: backtest_out/
           if-no-files-found: error
 
-      # ----------------------------
-      # MODE: tune
-      # ----------------------------
+      # =======================
+      # MODE: tune (automatic hyperparameter sweep)
+      # =======================
       - name: Run tuner sweep
         if: ${{ inputs.mode == 'tune' }}
+        shell: bash
         run: |
+          set -euo pipefail
+          # Optional: pass specific years to focus the sweep
+          YEARS="${{ inputs.years }}"
+          if [ -n "$YEARS" ]; then
+            # many users just run the default which is hardcoded in tune_config.py
+            echo "Using years: $YEARS (note: tune_config.py example ignores CLI; edit file to wire through if desired)"
+          fi
           python -m src.tune_config
 
       - name: Upload tuning results
