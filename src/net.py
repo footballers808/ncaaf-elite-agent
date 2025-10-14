@@ -1,81 +1,224 @@
-# src/net.py
-from __future__ import annotations
+name: NCAAF Elite Agent
 
-import os
-import time
-from typing import Any, Dict, Optional
-from urllib.parse import urljoin
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode to run"
+        required: true
+        default: "predict"
+      week:
+        description: "ISO week (yyyy-ww) or 'auto'"
+        required: false
+        default: "auto"
+      commit_best:
+        description: "If 'true', open a PR applying the merged tuned config"
+        required: false
+        default: "false"
+  schedule:
+    - cron: "0 13 * * 1"   # Mondays 13:00 UTC
 
-import requests
+permissions:
+  contents: write
 
-BASE = "https://api.collegefootballdata.com"
+concurrency:
+  group: ncaaf-elite-agent-${{ github.ref }}
+  cancel-in-progress: false
 
-# Secrets/knobs (can be set in GitHub Actions env)
-_API = (os.environ.get("CFBD_API_KEY") or "").strip()
-_MIN_SLEEP = float(os.environ.get("CFBD_MIN_SLEEP_MS", "300")) / 1000.0  # min gap between calls
-_MAX_RETRIES = int(os.environ.get("CFBD_MAX_RETRIES", "8"))
-_TIMEOUT = float(os.environ.get("CFBD_TIMEOUT", "30"))
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
-_session = requests.Session()
-_session.headers.update({"Accept": "application/json"})
-if _API:
-    _session.headers.update({"Authorization": f"Bearer {_API}"})
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
 
+      # --- CFBD ---
+      CFBD_API_KEY:        ${{ secrets.CFBD_API_KEY }}
+      CFBD_MIN_SLEEP_MS:   "300"   # increase to 500–750 if you still hit 429s
+      CFBD_MAX_RETRIES:    "8"
 
-_last_call_monotonic = 0.0
+      # --- Email (optional) ---
+      SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+      SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+      SMTP_USER:     ${{ secrets.SMTP_USER }}
+      SMTP_PASS:     ${{ secrets.SMTP_PASS }}
+      FROM_ADDR:     ${{ secrets.FROM_ADDR }}
+      TO_ADDRS:      ${{ secrets.TO_ADDRS }}
 
+      # --- Slack (optional) ---
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
 
-def _throttle() -> None:
-    """Ensure a minimum gap between calls to avoid 429s."""
-    global _last_call_monotonic
-    now = time.monotonic()
-    wait = _MIN_SLEEP - (now - _last_call_monotonic)
-    if wait > 0:
-        time.sleep(wait)
-    _last_call_monotonic = time.monotonic()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-def cfbd_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None):
-    """
-    GET wrapper with throttle + retry/backoff (handles 429/5xx).
-    Returns parsed JSON (or raises on final failure).
-    """
-    url = urljoin(BASE, path)
-    params = params or {}
-    timeout = timeout or _TIMEOUT
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
 
-    backoff_base = 1.5  # seconds, exponential
+      # ---------- CACHES ----------
+      - name: Cache CFBD responses
+        uses: actions/cache@v4
+        with:
+          path: .cache/cfbd
+          key: cfbd-${{ runner.os }}-v1
+          restore-keys: |
+            cfbd-${{ runner.os }}-
 
-    last_exc: Optional[Exception] = None
-    for attempt in range(_MAX_RETRIES):
-        _throttle()
-        try:
-            r = _session.get(url, params=params, timeout=timeout)
-        except Exception as e:
-            last_exc = e
-            time.sleep(min(backoff_base * (2 ** attempt), 60.0))
-            continue
+      - name: Restore penalty features cache
+        uses: actions/cache@v4
+        with:
+          path: artifacts/features
+          key: penalties-${{ runner.os }}-v1
+          restore-keys: |
+            penalties-${{ runner.os }}-
 
-        # Handle 429 rate limit explicitly
-        if r.status_code == 429:
-            retry_after = r.headers.get("Retry-After")
-            sleep_s = float(retry_after) if retry_after else backoff_base * (2 ** attempt)
-            time.sleep(min(max(sleep_s, _MIN_SLEEP), 60.0))
-            continue
+      # ---------- CONFIG CHECK ----------
+      - name: Apply tuned config (if present) + validate
+        if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
+        run: |
+          if [ -f tuning-results/best_config.yaml ]; then
+            echo "Found tuning-results/best_config.yaml"
+            if [ -f tools/apply_best_config.py ]; then
+              python tools/apply_best_config.py
+              cp config.merged.yaml config.yaml || true
+            else
+              echo "No apply_best_config.py; skipping auto-merge."
+            fi
+          else
+            echo "No tuning-results/best_config.yaml present; using repo config.yaml"
+          fi
+          if [ -f tools/validate_config.py ]; then
+            python tools/validate_config.py
+          else
+            echo "No validate script found; skipping."
+          fi
 
-        # Retry on transient 5xx
-        if 500 <= r.status_code < 600:
-            time.sleep(min(backoff_base * (2 ** attempt), 60.0))
-            continue
+      # ---------- BUILD FEATURES (penalties) ----------
+      - name: Build penalty features
+        if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'backtest' || github.event.inputs.mode == 'tune' }}
+        run: |
+          set -e
+          tries=0
+          until [ $tries -ge 2 ]
+          do
+            python -m src.data_penalties --years 5 --windows 3,5,10 && break
+            tries=$((tries+1))
+            echo "Retrying penalty feature build ($tries/2)..."
+            sleep 15
+          done
 
-        # Success or other non-retry error
-        r.raise_for_status()
-        if not r.content:
-            return None
-        ct = (r.headers.get("Content-Type") or "").lower()
-        return r.json() if "json" in ct or r.text.startswith("{") else r.text
+      - name: Save penalty features cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts/features
+          key: penalties-${{ runner.os }}-v1
 
-    # If we fall through, raise the last error or a generic one
-    if last_exc:
-        raise last_exc
-    raise requests.HTTPError(f"CFBD GET failed after {_MAX_RETRIES} attempts: {url} {params}")
+      # ---------- MODES ----------
+      - name: Predict
+        if: ${{ github.event.inputs.mode == 'predict' }}
+        run: |
+          # Produces probabilities + predicted final scores in predictions.csv
+          python -m src.predict --week "${{ github.event.inputs.week }}" --out artifacts/predictions.csv
+          # Optional downstreams (ignore if missing)
+          python -m src.odds   --week "${{ github.event.inputs.week }}" --out artifacts/market_lines.csv || true
+          python -m src.edges  --pred artifacts/predictions.csv --lines artifacts/market_lines.csv --out artifacts/edges.csv || true
+          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html || true
+
+      - name: Label
+        if: ${{ github.event.inputs.mode == 'label' }}
+        run: |
+          python -m src.label --week "${{ github.event.inputs.week }}" --out artifacts/labels.csv
+
+      - name: Learn
+        if: ${{ github.event.inputs.mode == 'learn' }}
+        run: |
+          # Trains a baseline model on rolling penalty features and saves to artifacts/model.joblib
+          python -m src.learn --years 5 --save artifacts/model.joblib
+
+      - name: Report
+        if: ${{ github.event.inputs.mode == 'report' }}
+        run: |
+          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
+
+      - name: Backtest
+        if: ${{ github.event.inputs.mode == 'backtest' }}
+        env:
+          BACKTEST_STRICT: "0"
+        run: |
+          # Uses the same model as Predict (via src.model.predict_home_win_prob)
+          python -u -m src.backtest --years 2 --season-type regular --out artifacts/backtest.json
+
+      - name: Tune
+        if: ${{ github.event.inputs.mode == 'tune' }}
+        env:
+          TUNE_ITERS: "8"        # bump to 40–60 when stable
+          TUNE_FAIL_OPEN: "1"    # set "0" for strict runs
+        run: |
+          python -m src.tune
+
+      # ---------- ARTIFACTS ----------
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-artifacts
+          path: |
+            artifacts/**
+            tuning-results/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ---------- OPTIONAL: PR to apply merged tuned config ----------
+      - name: Commit merged tuned config to branch
+        if: ${{ github.event.inputs.commit_best == 'true' && hashFiles('config.merged.yaml') != '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BR="auto/best-config-${{ github.run_id }}"
+          git checkout -b "$BR"
+          cp config.merged.yaml config.yaml
+          git add config.yaml
+          git commit -m "chore: apply best_config.yaml (run ${{ github.run_id }})"
+          git push -u origin "$BR"
+          echo "PR step created. Open it to merge the tuned config."
+
+      # ---------- OPTIONAL EMAIL ----------
+      - name: Email report
+        if: ${{ env.SMTP_HOST != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ env.SMTP_HOST }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USER }}
+          password: ${{ env.SMTP_PASS }}
+          subject: "NCAAF Agent – ${{ github.event.inputs.mode }} – run ${{ github.run_id }}"
+          from: ${{ env.FROM_ADDR }}
+          to: ${{ env.TO_ADDRS }}
+          content_type: text/html
+          convert_markdown: false
+          attachments: |
+            artifacts/report.html
+            artifacts/edges.csv
+            artifacts/predictions.csv
+
+      # ---------- OPTIONAL SLACK ----------
+      - name: Slack webhook
+        if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
+        run: |
+          if [ -f artifacts/edges.csv ]; then
+            MSG="Edges ready for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
+          else
+            MSG="No edges.csv found for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
+          fi
+          curl -X POST -H "Content-type: application/json" \
+            --data "{\"text\":\"${MSG}\"}" "$SLACK_WEBHOOK"
