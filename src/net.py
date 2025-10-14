@@ -1,51 +1,81 @@
 # src/net.py
-import hashlib, json, os, pathlib, time, random
-from typing import Dict, Any, Optional
+from __future__ import annotations
+
+import os
+import time
+from typing import Any, Dict, Optional
+from urllib.parse import urljoin
+
 import requests
 
-CFBD = "https://api.collegefootballdata.com"
-CACHE_DIR = pathlib.Path(".cache/cfbd")
-CACHE_TTL_SECS = 7 * 24 * 3600  # 7 days
+BASE = "https://api.collegefootballdata.com"
 
-# Use a dedicated session so monkey-patched requests.get won't intercept us.
-# (requests_cached only replaces requests.get, not Session().get)
-_SESSION = requests.Session()
+# Secrets/knobs (can be set in GitHub Actions env)
+_API = (os.environ.get("CFBD_API_KEY") or "").strip()
+_MIN_SLEEP = float(os.environ.get("CFBD_MIN_SLEEP_MS", "300")) / 1000.0  # min gap between calls
+_MAX_RETRIES = int(os.environ.get("CFBD_MAX_RETRIES", "8"))
+_TIMEOUT = float(os.environ.get("CFBD_TIMEOUT", "30"))
 
-def _headers() -> Dict[str, str]:
-    key = os.environ.get("CFBD_API_KEY", "")
-    return {"Authorization": f"Bearer {key}"} if key else {}
+_session = requests.Session()
+_session.headers.update({"Accept": "application/json"})
+if _API:
+    _session.headers.update({"Authorization": f"Bearer {_API}"})
 
-def _key(url: str, params: Optional[Dict[str, Any]]) -> pathlib.Path:
-    q = "&".join(f"{k}={params[k]}" for k in sorted(params or {}))
-    base = f"{url}?{q}" if q else url
-    h = hashlib.sha1(base.encode("utf-8")).hexdigest()
-    return CACHE_DIR / f"{h}.json"
 
-def cfbd_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 5) -> Any:
+_last_call_monotonic = 0.0
+
+
+def _throttle() -> None:
+    """Ensure a minimum gap between calls to avoid 429s."""
+    global _last_call_monotonic
+    now = time.monotonic()
+    wait = _MIN_SLEEP - (now - _last_call_monotonic)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call_monotonic = time.monotonic()
+
+
+def cfbd_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None):
     """
-    GET wrapper with on-disk cache + exponential backoff.
-    path can be '/teams/fbs' or full 'https://api.collegefootballdata.com/teams/fbs'
+    GET wrapper with throttle + retry/backoff (handles 429/5xx).
+    Returns parsed JSON (or raises on final failure).
     """
-    url = path if path.startswith("http") else f"{CFBD}{path}"
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    fp = _key(url, params)
+    url = urljoin(BASE, path)
+    params = params or {}
+    timeout = timeout or _TIMEOUT
 
-    # serve cached if fresh
-    if fp.exists() and (time.time() - fp.stat().st_mtime) < CACHE_TTL_SECS:
-        return json.loads(fp.read_text(encoding="utf-8"))
+    backoff_base = 1.5  # seconds, exponential
 
-    attempt = 0
-    while True:
-        r = _SESSION.get(url, params=params or {}, headers=_headers(), timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            fp.write_text(json.dumps(data), encoding="utf-8")
-            return data
-
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-            attempt += 1
-            sleep_s = min(30, 2 ** attempt) + random.uniform(0.0, 0.5)
-            time.sleep(sleep_s)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_RETRIES):
+        _throttle()
+        try:
+            r = _session.get(url, params=params, timeout=timeout)
+        except Exception as e:
+            last_exc = e
+            time.sleep(min(backoff_base * (2 ** attempt), 60.0))
             continue
 
+        # Handle 429 rate limit explicitly
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            sleep_s = float(retry_after) if retry_after else backoff_base * (2 ** attempt)
+            time.sleep(min(max(sleep_s, _MIN_SLEEP), 60.0))
+            continue
+
+        # Retry on transient 5xx
+        if 500 <= r.status_code < 600:
+            time.sleep(min(backoff_base * (2 ** attempt), 60.0))
+            continue
+
+        # Success or other non-retry error
         r.raise_for_status()
+        if not r.content:
+            return None
+        ct = (r.headers.get("Content-Type") or "").lower()
+        return r.json() if "json" in ct or r.text.startswith("{") else r.text
+
+    # If we fall through, raise the last error or a generic one
+    if last_exc:
+        raise last_exc
+    raise requests.HTTPError(f"CFBD GET failed after {_MAX_RETRIES} attempts: {url} {params}")
