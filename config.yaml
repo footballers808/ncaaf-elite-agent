@@ -57,6 +57,8 @@ eval:
 edge:
   threshold_spread: 1.0514612357395061
   threshold_total: 3.9247746304049858
-
+scores:
+  sigma_margin: 16.0   # how “volatile” margins are
+  avg_total: 55.0      # fallback total when market total absent
 
 
