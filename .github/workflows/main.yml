@@ -73,7 +73,7 @@ jobs:
           restore-keys: |
             penalties-${{ runner.os }}-
 
-      # ---------- CONFIG VALIDATION (no artifact restore needed) ----------
+      # ---------- CONFIG CHECK (no artifact restore needed) ----------
       - name: Apply tuned config (if present) + validate
         if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
         run: |
@@ -100,7 +100,6 @@ jobs:
         run: |
           python -m src.data_penalties --years 5 --windows 3,5,10
 
-      # Save (or refresh) the penalties cache after building
       - name: Save penalty features cache
         if: always()
         uses: actions/cache/save@v4
@@ -112,7 +111,9 @@ jobs:
       - name: Predict
         if: ${{ github.event.inputs.mode == 'predict' }}
         run: |
+          # Produces probabilities + predicted final scores in predictions.csv
           python -m src.predict --week "${{ github.event.inputs.week }}" --out artifacts/predictions.csv
+          # Optional downstreams (ignore if missing)
           python -m src.odds   --week "${{ github.event.inputs.week }}" --out artifacts/market_lines.csv || true
           python -m src.edges  --pred artifacts/predictions.csv --lines artifacts/market_lines.csv --out artifacts/edges.csv || true
           python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html || true
@@ -125,7 +126,7 @@ jobs:
       - name: Learn
         if: ${{ github.event.inputs.mode == 'learn' }}
         run: |
-          # Train and save a model; file name can be model.joblib or model.bin (model loader checks both)
+          # Trains a baseline model on rolling penalty features and saves to artifacts/model.joblib
           python -m src.learn --years 5 --save artifacts/model.joblib
 
       - name: Report
@@ -138,6 +139,7 @@ jobs:
         env:
           BACKTEST_STRICT: "0"
         run: |
+          # Uses the same model as Predict (via src.model.predict_home_win_prob)
           python -u -m src.backtest --years 2 --season-type regular --out artifacts/backtest.json
 
       - name: Tune
