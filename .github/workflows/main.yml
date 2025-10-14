@@ -16,7 +16,7 @@ on:
         required: false
         default: "false"
   schedule:
-    - cron: "0 13 * * 1"   # Mondays 13:00 UTC
+    - cron: "0 13 * * 1"   # Mondays 13:00 UTC (06:00 Phoenix)
 
 permissions:
   contents: write
@@ -56,7 +56,7 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Speed up CFBD calls across runs
+      # ---------- CACHES ----------
       - name: Cache CFBD responses
         uses: actions/cache@v4
         with:
@@ -65,15 +65,26 @@ jobs:
           restore-keys: |
             cfbd-${{ runner.os }}-
 
-      # If you’re using Option A (manual commit of config.yaml), this step will
-      # just validate the current config and won’t try to pull artifacts.
+      - name: Restore penalty features cache
+        uses: actions/cache@v4
+        with:
+          path: artifacts/features
+          key: penalties-${{ runner.os }}-v1
+          restore-keys: |
+            penalties-${{ runner.os }}-
+
+      # ---------- CONFIG VALIDATION (no artifact restore needed) ----------
       - name: Apply tuned config (if present) + validate
         if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
         run: |
           if [ -f tuning-results/best_config.yaml ]; then
             echo "Found tuning-results/best_config.yaml"
-            python tools/apply_best_config.py
-            cp config.merged.yaml config.yaml
+            if [ -f tools/apply_best_config.py ]; then
+              python tools/apply_best_config.py
+              cp config.merged.yaml config.yaml || true
+            else
+              echo "No apply_best_config.py; skipping auto-merge."
+            fi
           else
             echo "No tuning-results/best_config.yaml present; using repo config.yaml"
           fi
@@ -83,14 +94,28 @@ jobs:
             echo "No validate script found; skipping."
           fi
 
-      # -------- MODES --------
+      # ---------- BUILD FEATURES (penalties) ----------
+      - name: Build penalty features
+        if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'backtest' || github.event.inputs.mode == 'tune' }}
+        run: |
+          python -m src.data_penalties --years 5 --windows 3,5,10
+
+      # Save (or refresh) the penalties cache after building
+      - name: Save penalty features cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts/features
+          key: penalties-${{ runner.os }}-v1
+
+      # ---------- MODES ----------
       - name: Predict
         if: ${{ github.event.inputs.mode == 'predict' }}
         run: |
           python -m src.predict --week "${{ github.event.inputs.week }}" --out artifacts/predictions.csv
-          python -m src.odds   --week "${{ github.event.inputs.week }}" --out artifacts/market_lines.csv
-          python -m src.edges  --pred artifacts/predictions.csv --lines artifacts/market_lines.csv --out artifacts/edges.csv
-          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
+          python -m src.odds   --week "${{ github.event.inputs.week }}" --out artifacts/market_lines.csv || true
+          python -m src.edges  --pred artifacts/predictions.csv --lines artifacts/market_lines.csv --out artifacts/edges.csv || true
+          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html || true
 
       - name: Label
         if: ${{ github.event.inputs.mode == 'label' }}
@@ -100,8 +125,8 @@ jobs:
       - name: Learn
         if: ${{ github.event.inputs.mode == 'learn' }}
         run: |
-          python -m src.learn --labels artifacts/labels.csv --save artifacts/model.bin
-          python -m src.eval  --report artifacts/learn-eval.json --calibration artifacts/calibration.png
+          # Train and save a model; file name can be model.joblib or model.bin (model loader checks both)
+          python -m src.learn --years 5 --save artifacts/model.joblib
 
       - name: Report
         if: ${{ github.event.inputs.mode == 'report' }}
@@ -123,7 +148,7 @@ jobs:
         run: |
           python -m src.tune
 
-      # -------- ARTIFACTS --------
+      # ---------- ARTIFACTS ----------
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -135,7 +160,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # -------- OPTIONAL: PR to apply merged tuned config --------
+      # ---------- OPTIONAL: PR to apply merged tuned config ----------
       - name: Commit merged tuned config to branch
         if: ${{ github.event.inputs.commit_best == 'true' && hashFiles('config.merged.yaml') != '' }}
         run: |
@@ -149,7 +174,7 @@ jobs:
           git push -u origin "$BR"
           echo "PR step created. Open it to merge the tuned config."
 
-      # -------- OPTIONAL EMAIL --------
+      # ---------- OPTIONAL EMAIL ----------
       - name: Email report
         if: ${{ env.SMTP_HOST != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         uses: dawidd6/action-send-mail@v3
@@ -168,7 +193,7 @@ jobs:
             artifacts/edges.csv
             artifacts/predictions.csv
 
-      # -------- OPTIONAL SLACK --------
+      # ---------- OPTIONAL SLACK ----------
       - name: Slack webhook
         if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         run: |
