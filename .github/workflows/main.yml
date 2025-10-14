@@ -16,7 +16,7 @@ on:
         required: false
         default: "false"
   schedule:
-    - cron: "0 13 * * 1"   # Mondays 13:00 UTC (06:00 Phoenix)
+    - cron: "0 13 * * 1"   # Mondays 13:00 UTC
 
 permissions:
   contents: write
@@ -32,13 +32,21 @@ jobs:
 
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+
+      # --- CFBD ---
+      CFBD_API_KEY:        ${{ secrets.CFBD_API_KEY }}
+      CFBD_MIN_SLEEP_MS:   "300"   # increase to 500–750 if you still hit 429s
+      CFBD_MAX_RETRIES:    "8"
+
+      # --- Email (optional) ---
       SMTP_HOST:     ${{ secrets.SMTP_HOST }}
       SMTP_PORT:     ${{ secrets.SMTP_PORT }}
       SMTP_USER:     ${{ secrets.SMTP_USER }}
       SMTP_PASS:     ${{ secrets.SMTP_PASS }}
       FROM_ADDR:     ${{ secrets.FROM_ADDR }}
       TO_ADDRS:      ${{ secrets.TO_ADDRS }}
+
+      # --- Slack (optional) ---
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
 
     steps:
@@ -73,7 +81,7 @@ jobs:
           restore-keys: |
             penalties-${{ runner.os }}-
 
-      # ---------- CONFIG CHECK (no artifact restore needed) ----------
+      # ---------- CONFIG CHECK ----------
       - name: Apply tuned config (if present) + validate
         if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
         run: |
@@ -98,7 +106,15 @@ jobs:
       - name: Build penalty features
         if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'backtest' || github.event.inputs.mode == 'tune' }}
         run: |
-          python -m src.data_penalties --years 5 --windows 3,5,10
+          set -e
+          tries=0
+          until [ $tries -ge 2 ]
+          do
+            python -m src.data_penalties --years 5 --windows 3,5,10 && break
+            tries=$((tries+1))
+            echo "Retrying penalty feature build ($tries/2)..."
+            sleep 15
+          done
 
       - name: Save penalty features cache
         if: always()
