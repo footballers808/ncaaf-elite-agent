@@ -33,10 +33,11 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: "1"
 
-      # --- CFBD ---
+      # --- CFBD controls ---
       CFBD_API_KEY:        ${{ secrets.CFBD_API_KEY }}
-      CFBD_MIN_SLEEP_MS:   "300"   # increase to 500–750 if you still hit 429s
-      CFBD_MAX_RETRIES:    "8"
+      CFBD_MIN_SLEEP_MS:   "1000"   # throttle between requests (bump if needed)
+      CFBD_MAX_RETRIES:    "12"     # how many retry attempts per call
+      CFBD_BACKOFF_BASE_S: "2.0"    # base for exponential backoff
 
       # --- Email (optional) ---
       SMTP_HOST:     ${{ secrets.SMTP_HOST }}
@@ -102,8 +103,8 @@ jobs:
             echo "No validate script found; skipping."
           fi
 
-      # ---------- BUILD FEATURES (penalties) ----------
-      - name: Build penalty features
+      # ---------- BUILD FEATURES (shared warmup; safe to retry) ----------
+      - name: Build penalty features (warmup)
         if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'backtest' || github.event.inputs.mode == 'tune' }}
         run: |
           set -e
@@ -112,9 +113,9 @@ jobs:
           do
             python -m src.data_penalties --years 5 --windows 3,5,10 && break
             tries=$((tries+1))
-            echo "Retrying penalty feature build ($tries/2)..."
-            sleep 15
-          done
+            echo "Retrying penalty feature warmup ($tries/2)..."
+            sleep 20
+          done || true
 
       - name: Save penalty features cache
         if: always()
@@ -139,10 +140,37 @@ jobs:
         run: |
           python -m src.label --week "${{ github.event.inputs.week }}" --out artifacts/labels.csv
 
+      # >>> Hardened Learn step: progressively build features (1→2→3 yrs), then train
       - name: Learn
         if: ${{ github.event.inputs.mode == 'learn' }}
         run: |
-          # Trains a baseline model on rolling penalty features and saves to artifacts/model.joblib
+          set -e
+
+          build_features () {
+            YEARS=$1
+            echo "== Building penalty features (years=${YEARS}) =="
+            tries=0
+            until [ $tries -ge 3 ]
+            do
+              python -m src.data_penalties --years ${YEARS} --windows 3,5,10 && return 0
+              tries=$((tries+1))
+              echo "Retry ${tries}/3 for years=${YEARS}..."
+              sleep 20
+            done
+            return 1
+          }
+
+          if [ ! -f artifacts/features/penalties.parquet ]; then build_features 1 || true; fi
+          if [ ! -f artifacts/features/penalties.parquet ]; then build_features 2 || true; fi
+          if [ ! -f artifacts/features/penalties.parquet ]; then build_features 3 || true; fi
+
+          if [ ! -f artifacts/features/penalties.parquet ]; then
+            echo "ERROR: penalties.parquet still missing after fallbacks."
+            exit 1
+          fi
+
+          # Train and save model (learn.py may request up to 5 seasons;
+          # it'll consume whatever is in artifacts/features)
           python -m src.learn --years 5 --save artifacts/model.joblib
 
       - name: Report
@@ -155,7 +183,6 @@ jobs:
         env:
           BACKTEST_STRICT: "0"
         run: |
-          # Uses the same model as Predict (via src.model.predict_home_win_prob)
           python -u -m src.backtest --years 2 --season-type regular --out artifacts/backtest.json
 
       - name: Tune
