@@ -1,4 +1,9 @@
 {
-  "Oregon": 0.7,
-  "USC": -0.4
+  "Arizona State": {
+    "2025-06": { "qb_out": 1, "tempo_down": 1 },
+    "all": { "coach_change": 1 }
+  },
+  "Texas State": {
+    "2025-06": { "tempo_up": 1 }
+  }
 }
