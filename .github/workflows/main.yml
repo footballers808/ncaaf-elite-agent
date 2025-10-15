@@ -32,16 +32,21 @@ jobs:
 
     env:
       PYTHONDONTWRITEBYTECODE: "1"
+      # CFBD throttling defaults (learn/tune can override per-step if desired)
       CFBD_API_KEY:        ${{ secrets.CFBD_API_KEY }}
       CFBD_MIN_SLEEP_MS:   "1000"
       CFBD_MAX_RETRIES:    "12"
       CFBD_BACKOFF_BASE_S: "2.0"
+
+      # Email (optional)
       SMTP_HOST:     ${{ secrets.SMTP_HOST }}
       SMTP_PORT:     ${{ secrets.SMTP_PORT }}
       SMTP_USER:     ${{ secrets.SMTP_USER }}
       SMTP_PASS:     ${{ secrets.SMTP_PASS }}
       FROM_ADDR:     ${{ secrets.FROM_ADDR }}
       TO_ADDRS:      ${{ secrets.TO_ADDRS }}
+
+      # Slack (optional)
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
 
     steps:
@@ -59,6 +64,7 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
+      # ---------- CACHES ----------
       - name: Cache CFBD responses
         uses: actions/cache@v4
         with:
@@ -75,6 +81,7 @@ jobs:
           restore-keys: |
             penalties-${{ runner.os }}-
 
+      # ---------- CONFIG CHECK ----------
       - name: Apply tuned config (if present) + validate
         if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
         run: |
@@ -87,7 +94,7 @@ jobs:
               echo "No apply_best_config.py; skipping auto-merge."
             fi
           else
-            echo "No tuning-results/best_config.yaml present; using repo config.yaml"
+            echo "No tuning-results/best_config.yaml; using repo config.yaml"
           fi
           if [ -f tools/validate_config.py ]; then
             python tools/validate_config.py
@@ -95,18 +102,21 @@ jobs:
             echo "No validate script found; skipping."
           fi
 
-      # Warmup: small build with retries
+      # ---------- WARMUP (lighter + quick retries) ----------
       - name: Build penalty features (warmup)
         if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'backtest' || github.event.inputs.mode == 'tune' }}
+        env:
+          CFBD_MAX_RETRIES: "3"
+          CFBD_MIN_SLEEP_MS: "1500"
         run: |
           set -e
           tries=0
-          until [ $tries -ge 2 ]
+          until [ $tries -ge 1 ]
           do
-            python -m src.data_penalties --years 2 --windows 3,5,10 && break
+            python -m src.data_penalties --years 1 --windows 3,5,10 && break
             tries=$((tries+1))
-            echo "Warmup retry ${tries}/2..."
-            sleep 20
+            echo "Warmup retry ${tries}/1..."
+            sleep 10
           done || true
 
       - name: Save penalty features cache
@@ -116,6 +126,7 @@ jobs:
           path: artifacts/features
           key: penalties-${{ runner.os }}-v1
 
+      # ---------- MODES ----------
       - name: Predict
         if: ${{ github.event.inputs.mode == 'predict' }}
         run: |
@@ -175,6 +186,7 @@ jobs:
         run: |
           python -m src.tune
 
+      # ---------- ARTIFACTS ----------
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
