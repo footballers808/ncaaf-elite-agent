@@ -6,14 +6,9 @@ on:
       mode:
         description: "run mode"
         required: true
-        default: "auto"   # auto | predict | learn | backtest | tune
+        default: "auto"
         type: choice
-        options:
-          - auto
-          - predict
-          - learn
-          - backtest
-          - tune
+        options: [auto, predict, learn, backtest, tune]
       iso_week:
         description: "ISO week to score (yyyy-ww) or 'auto'"
         required: true
@@ -23,7 +18,7 @@ on:
         required: true
         default: "false"
   schedule:
-    - cron: "23 11 * * 5"   # Fri 11:23 UTC – change to taste
+    - cron: "23 11 * * 5"
   push:
     branches: [ main ]
     paths:
@@ -49,7 +44,6 @@ env:
   EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
   SMTP_HOST: ${{ secrets.SMTP_HOST }}
   SMTP_PORT: ${{ secrets.SMTP_PORT }}
-  # cache scopes
   PENALTY_CACHE_SCOPE: penalties-Linux-v1
   CFBD_CACHE_SCOPE: cfbd-http-v1
 
@@ -59,23 +53,19 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      # ---------- Checkout ----------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- Setup Python ----------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ---------- Install dependencies ----------
       - name: Install dependencies
         run: |
           python -m pip install -U pip wheel
           pip install -r requirements.txt
 
-      # ---------- Cache CFBD responses (requests-cache) ----------
       - name: Cache CFBD responses
         id: cfbd-cache
         uses: actions/cache@v4
@@ -87,108 +77,85 @@ jobs:
           restore-keys: |
             ${{ env.CFBD_CACHE_SCOPE }}-
 
-      # ---------- Restore penalty features cache ----------
       - name: Restore penalty features cache
         id: penalty-restore
         uses: actions/cache/restore@v4
         with:
-          path: |
-            artifacts/features
+          path: artifacts/features
           key: ${{ env.PENALTY_CACHE_SCOPE }}-${{ github.sha }}
           restore-keys: |
             ${{ env.PENALTY_CACHE_SCOPE }}-
 
-      # ---------- Apply tuned config (if present) + validate ----------
-      - name: Apply tuned config (if present) + validate
+      - name: Apply tuned config if present + validate
         run: |
           set -e
           if [ -f tuning-results/best_config.yaml ]; then
             echo "Using tuned config"
             cp tuning-results/best_config.yaml config.yaml
-          else
-            echo "No tuned config, keeping repo config.yaml"
           fi
           python -m src.tools.validate_config
 
-      # ---------- Backfill penalties (strict, staged 5→3→1) ----------
-      # We do this in 'auto' and 'learn' and 'predict' so we always have recent features.
-      - name: Backfill penalties (strict, staged 5→3→1)
-        if: ${{ contains('auto,learn,predict', github.event.inputs.mode) || github.event_name == 'schedule' }}
+      # --------- Backfill penalties (staged 5-3-1) ----------
+      - name: Backfill penalties (staged 5-3-1)
+        if: ${{ contains(fromJSON('["auto","learn","predict"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
-          echo "== Building penalty features for last 5 season(s) =="
-          # 1) hard backfill 5 seasons, strict: retry and stop if current year fails fast
+          echo "== build penalties: 5 seasons strict =="
           python -m src.data_penalties --years 5 --windows 3,5,10 --strict
-          # 2) ensure last 3 if any partials failed
+          echo "== build penalties: 3 seasons strict =="
           python -m src.data_penalties --years 3 --windows 3,5,10 --strict
-          # 3) ensure last 1 as final pass (fast)
+          echo "== build penalties: 1 season strict =="
           python -m src.data_penalties --years 1 --windows 3,5,10 --strict
           ls -l artifacts/features || true
 
-      # ---------- Save penalty features cache ----------
       - name: Save penalty features cache
         if: ${{ always() }}
         uses: actions/cache/save@v4
         with:
-          path: |
-            artifacts/features
+          path: artifacts/features
           key: ${{ env.PENALTY_CACHE_SCOPE }}-${{ github.sha }}
 
-      # ---------- Predict (scores + win prob) ----------
+      # --------- Predict ----------
       - name: Predict (scores + win prob)
-        if: ${{ contains('auto,predict', github.event.inputs.mode) || github.event_name == 'schedule' }}
+        if: ${{ contains(fromJSON('["auto","predict"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
-          ISO=${{ github.event.inputs.iso_week }}
+          ISO="${{ github.event.inputs.iso_week }}"
           if [ -z "$ISO" ] || [ "$ISO" = "auto" ]; then
-            ISO=$(python - <<'PY'
-import datetime, sys
-today = datetime.date.today()
-iso = today.isocalendar()
-print(f"{iso.year}-{iso.week:02d}")
-PY
-)
+            ISO=$(python -c "import datetime; d=datetime.date.today(); iso=d.isocalendar(); print(f'{iso.year}-{iso.week:02d}')")
           fi
           echo "Scoring ISO week: $ISO"
           python -m src.predict --iso-week "$ISO" --features artifacts/features/penalties.parquet --out artifacts/preds.parquet
 
-      # ---------- Label (NO --out flag) ----------
+      # --------- Label (NO --out) ----------
       - name: Label
-        if: ${{ contains('auto,learn', github.event.inputs.mode) || github.event_name == 'schedule' }}
+        if: ${{ contains(fromJSON('["auto","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
-          YEAR=$(date -u +%Y)            # Use previous completed season if needed:
-          # YEAR=$((YEAR-1))
-          python -m src.labeler --year "$YEAR" --season-type regular
+          Y=$(date -u +%Y)
+          python -m src.labeler --year "$Y" --season-type regular
 
-      # ---------- Learn (strict, real data only) ----------
-      - name: Learn (strict, real data only)
-        if: ${{ contains('auto,learn', github.event.inputs.mode) || github.event_name == 'schedule' }}
+      # --------- Learn ----------
+      - name: Learn (strict, real data)
+        if: ${{ contains(fromJSON('["auto","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
-          test -f artifacts/features/penalties.parquet || { echo "penalty features missing"; exit 1; }
-          test -f artifacts/labels.parquet   || { echo "labels missing"; exit 1; }
-          python -m src.learn \
-            --features artifacts/features/penalties.parquet \
-            --labels artifacts/labels.parquet \
-            --out artifacts/model.joblib
+          test -f artifacts/features/penalties.parquet || { echo "missing penalties.parquet"; exit 1; }
+          test -f artifacts/labels.parquet || { echo "missing labels.parquet"; exit 1; }
+          python -m src.learn --features artifacts/features/penalties.parquet --labels artifacts/labels.parquet --out artifacts/model.joblib
 
-      # ---------- Report ----------
+      # --------- Report ----------
       - name: Report
-        if: ${{ contains('auto,predict,learn', github.event.inputs.mode) || github.event_name == 'schedule' }}
+        if: ${{ contains(fromJSON('["auto","predict","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
-          # Email / Slack summary if you have mailer wired (optional):
           if [ -f artifacts/preds.parquet ]; then
             python -m src.reporter --preds artifacts/preds.parquet --out artifacts/report.md
           else
-            echo "No preds available; generating status report."
-            echo "# NCAAF Elite Agent" > artifacts/report.md
-            echo "" >> artifacts/report.md
-            echo "- run id: $GITHUB_RUN_ID" >> artifacts/report.md
+            printf "# NCAAF Elite Agent\n\n- run id: %s\n" "$GITHUB_RUN_ID" > artifacts/report.md
           fi
 
-      # ---------- Backtest ----------
+      # --------- Backtest ----------
       - name: Backtest
         if: ${{ github.event.inputs.mode == 'backtest' }}
         run: |
@@ -196,7 +163,7 @@ PY
           python -m src.backtest --years 5 --out artifacts/backtest.json
           cat artifacts/backtest.json || true
 
-      # ---------- Tune ----------
+      # --------- Tune ----------
       - name: Tune
         if: ${{ github.event.inputs.mode == 'tune' }}
         env:
@@ -206,9 +173,11 @@ PY
           python -m src.tune --iters 60 --storage "$OPTUNA_STORAGE" --out-dir tuning-results
           ls -l tuning-results || true
 
-      # ---------- Optional PR to apply tuned config ----------
+      # --------- Optional PR ----------
       - name: Commit merged tuned config to branch
         if: ${{ github.event.inputs.mode == 'tune' && github.event.inputs.pr_apply == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           if [ -f tuning-results/best_config.yaml ]; then
@@ -224,7 +193,6 @@ PY
             echo "No tuned config found, skipping PR."
           fi
 
-      # ---------- Upload artifacts ----------
       - name: Upload artifacts
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
