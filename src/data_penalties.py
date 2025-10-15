@@ -1,4 +1,4 @@
-import argparse, yaml
+import argparse, yaml, datetime as dt
 from .features import build_features
 
 def main():
@@ -11,8 +11,6 @@ def main():
     with open("config.yaml","r") as f:
         cfg = yaml.safe_load(f)
 
-    # Build features for N most recent seasons
-    import datetime as dt
     cur = dt.datetime.utcnow().year
     years = list(range(cur - args.years + 1, cur + 1))
     build_features(years, cfg.get("season_type","regular"), cfg)
