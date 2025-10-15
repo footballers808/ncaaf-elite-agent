@@ -1,45 +1,22 @@
-#!/usr/bin/env python3
-import yaml, sys, pathlib
+import sys, yaml, pathlib
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-CFG = ROOT / "config.yaml"
-
-REQUIRED_BOUNDS = {
-    ("train", "learning_rate"): (1e-6, 1.0),
-    ("train", "weight_decay"):  (0.0, 1.0),
-    ("data", "lookback_days"):  (3, 365),
-    ("data", "gap_days"):       (0, 14),  # to avoid leakage, >= 1 is safer
-    ("eval", "cv_folds"):       (2, 10),
-}
-
-def get(cfg, path):
-    for k in path: cfg = cfg[k]
-    return cfg
+REQUIRED = [
+  ("form_games", int),
+  ("pace_games", int),
+  ("injury_window_days", int),
+  ("model", dict),
+]
 
 def main():
-    cfg = yaml.safe_load(open(CFG, "r", encoding="utf-8"))
-    ok = True
-
-    # bounds sanity
-    for path, (lo, hi) in REQUIRED_BOUNDS.items():
-        try:
-            v = float(get(cfg, path))
-            if not (lo <= v <= hi):
-                print(f"❌ {'.'.join(path)}={v} out of [{lo},{hi}]")
-                ok = False
-        except Exception:
-            print(f"❌ missing/invalid: {'.'.join(path)}")
-            ok = False
-
-    # leakage guard: require temporal split + nonzero gap unless explicitly disabled
-    if cfg.get("eval", {}).get("split", "temporal") != "temporal":
-        print("⚠️ eval.split is not 'temporal' — confirm this is intentional.")
-
-    if cfg.get("data", {}).get("gap_days", 0) == 0:
-        print("⚠️ data.gap_days == 0 — consider >= 1 to reduce leak risk.")
-
-    print("✅ validate_config done." if ok else "❌ validate_config found issues.")
-    sys.exit(0 if ok else 2)
+    cfg = yaml.safe_load(pathlib.Path("config.yaml").read_text())
+    for key, typ in REQUIRED:
+        if key not in cfg:
+            print(f"missing required config: {key}", file=sys.stderr)
+            sys.exit(2)
+        if not isinstance(cfg[key], typ):
+            print(f"bad type for {key}, expected {typ}", file=sys.stderr)
+            sys.exit(2)
+    print("config ok")
 
 if __name__ == "__main__":
     main()
