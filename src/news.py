@@ -16,7 +16,6 @@ def main():
     try:
         df = pd.read_csv(args.inp)
     except Exception:
-        # produce empty parquet so downstream never fails
         pd.DataFrame(columns=["team","news_sentiment","injury_hint","motivation_hint"]).to_parquet(outp, index=False)
         print("news: input missing or unreadable; wrote empty features")
         return
@@ -34,7 +33,6 @@ def main():
     df["injury_hint"] = df["text"].map(lambda t: int(any(k in t for k in ["ankle","knee","hamstring","concussion","out","questionable","limited"])))
     df["motivation_hint"] = df["text"].map(lambda t: int(any(k in t for k in ["revenge","must win","rival","senior night","bowl eligibility"])))
 
-    # Aggregate by team (in case multiple notes per team)
     agg = df.groupby("team", as_index=False).agg(
         news_sentiment=("news_sentiment","mean"),
         injury_hint=("injury_hint","max"),
