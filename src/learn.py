@@ -1,59 +1,75 @@
-from __future__ import annotations
-import pandas as pd, numpy as np, joblib
-from .common import read_parquet, save_parquet
-from sklearn.model_selection import train_test_split
+import argparse, pathlib, pandas as pd, numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.model_selection import GroupKFold
 from sklearn.metrics import mean_absolute_error
-from lightgbm import LGBMRegressor
+import joblib, yaml
+from .common import safe_read_parquet, ART
 
-TARGETS = ["home_points","away_points"]
+TARGETS = ["home_score", "away_score"]
 
-def _select_features(df: pd.DataFrame):
-    drop = ["game_id","season","week","season_type","home","away","venue","weather"] + TARGETS
-    cols = [c for c in df.columns if c not in drop]
-    # numeric only
-    cols = [c for c in cols if df[c].dtype != "O"]
-    return cols
+def _build_training(features: pd.DataFrame, labels: pd.DataFrame):
+    # Pivot features to have one row per game with home & away columns
+    # Then join labels
+    def pivot_side(df, prefix, side_mask):
+        cols = ["game_id","team","pf_mean","pa_mean","pace_mean","injuries_recent",
+                "market_spread","market_total","wx_temp","wx_wind","wx_precip","neutral_site"]
+        x = df.loc[side_mask, cols].copy()
+        x = x.rename(columns={c: f"{prefix}_{c}" for c in cols if c not in ["game_id"]})
+        return x
 
-def train(features_path: str, labels_path: str, out_path: str):
-    X = read_parquet(features_path)
-    y = read_parquet(labels_path)
+    home = pivot_side(features, "home", features["team"].eq(features["home_team"]))
+    away = pivot_side(features, "away", features["team"].eq(features["away_team"]))
+    X = home.merge(away, on="game_id", how="inner")
+    y = labels[["game_id","home_score","away_score"]]
+    df = X.merge(y, on="game_id", how="inner").dropna()
+    # Basic sanity: drop columns not used for fit
+    feature_cols = [c for c in df.columns if c not in ["game_id","home_score","away_score","home_team","away_team"]]
+    return df[feature_cols], df[TARGETS], df["game_id"]
 
-    df = X.merge(y, on=["game_id","season","week","home","away"], how="inner")
-    cols = _select_features(df)
-    df = df.dropna(subset=cols)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--features", required=True)
+    ap.add_argument("--labels", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
 
-    Xmat = df[cols].fillna(df[cols].median())
-    models = {}
-    report = {}
+    with open("config.yaml","r") as f:
+        cfg = yaml.safe_load(f)
 
-    for tgt in TARGETS:
-        yvec = df[tgt].astype(float)
-        Xtr, Xva, ytr, yva = train_test_split(Xmat, yvec, test_size=0.2, random_state=42)
-        model = LGBMRegressor(
-            n_estimators=600,
-            learning_rate=0.03,
-            subsample=0.9,
-            colsample_bytree=0.8,
-            max_depth=-1,
-            num_leaves=63,
-            reg_lambda=2.0,
-            random_state=42
+    F = safe_read_parquet(pathlib.Path(args.features))
+    L = safe_read_parquet(pathlib.Path(args.labels))
+
+    X, Y, G = _build_training(F, L)
+    # CV by game_id groups (stable leakage guard)
+    gkf = GroupKFold(n_splits=5)
+    preds = np.zeros_like(Y.values, dtype=float)
+
+    if cfg["model"]["regressor"] == "random_forest":
+        base = RandomForestRegressor(
+            n_estimators=cfg["model"]["n_estimators"],
+            max_depth=cfg["model"]["max_depth"],
+            random_state=cfg["model"]["random_state"],
+            n_jobs=-1,
         )
-        model.fit(Xtr, ytr)
-        p = model.predict(Xva)
-        report[f"mae_{tgt}"] = float(np.round(mean_absolute_error(yva, p), 3))
-        models[tgt] = model
+    else:
+        base = RandomForestRegressor(n_estimators=400, max_depth=12, random_state=42, n_jobs=-1)
 
-    joblib.dump({"models": models, "features": cols}, out_path)
-    with open("artifacts/learn_report.txt","w") as f:
-        f.write(str(report))
-    return report
+    model = MultiOutputRegressor(base)
+
+    for tr, va in gkf.split(X, Y, groups=G):
+        model.fit(X.iloc[tr], Y.iloc[tr])
+        preds[va] = model.predict(X.iloc[va])
+
+    mae_home = mean_absolute_error(Y.iloc[:,0], preds[:,0])
+    mae_away = mean_absolute_error(Y.iloc[:,1], preds[:,1])
+    print(f"CV MAE home={mae_home:.2f} away={mae_away:.2f}")
+
+    # Fit on all and save
+    model.fit(X, Y)
+    outp = pathlib.Path(args.out)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"model": model, "features": X.columns.tolist()}, outp)
 
 if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--features", required=True)
-    p.add_argument("--labels", required=True)
-    p.add_argument("--out", required=True)
-    a = p.parse_args()
-    train(a.features, a.labels, a.out)
+    main()
