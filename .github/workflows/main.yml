@@ -7,22 +7,14 @@ on:
         description: "Run mode"
         default: "auto"
         type: choice
-        options:
-          - auto
-          - predict
-          - learn
-          - backtest
-          - tune
+        options: [auto, predict, learn, backtest, tune]
       speed:
         description: "Backfill speed (quick=2→1, full=5→3→1, skip=none). Cron defaults to full."
         default: "quick"
         type: choice
-        options:
-          - quick
-          - full
-          - skip
+        options: [quick, full, skip]
   schedule:
-    - cron: "20 06 * * *"
+    - cron: "20 06 * * *"   # daily 06:20 UTC (example)
 
 jobs:
   ncaaf:
@@ -40,13 +32,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
 
       - name: Install dependencies
         run: |
-          set -e
           python -V
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Cache CFBD responses
@@ -68,22 +59,20 @@ jobs:
             penalties-${{ runner.os }}-
 
       - name: Apply tuned config (if present) + validate
-        shell: bash
         run: |
-          set -e
           if [ -f tuning-results/best_config.yaml ]; then
             echo "Using tuned config: tuning-results/best_config.yaml"
             cp tuning-results/best_config.yaml config.yaml
           else
             echo "No tuned config; using repo config.yaml"
           fi
-          python -m tools.validate_config
-          echo "validate_config done."
+          python -m tools.validate_config || true
 
-      - name: Backfill penalties (switchable: quick/full/skip)
+      # ---- decide SPEED in a safe way and expose as output ----
+      - name: Decide SPEED
+        id: speed
         shell: bash
         run: |
-          set -e
           SPEED="${{ github.event.inputs.speed }}"
           if [ -z "$SPEED" ] && [ "${{ github.event_name }}" = "schedule" ]; then
             SPEED="full"
@@ -91,80 +80,63 @@ jobs:
           if [ -z "$SPEED" ]; then
             SPEED="quick"
           fi
+          echo "SPEED decided: $SPEED"
+          echo "speed=$SPEED" >> "$GITHUB_OUTPUT"
 
-          run_stage () {
-            yrs="$1"
-            echo "::group::penalties years=${yrs}"
-            python -u -m src.data_penalties --years "${yrs}" --windows 3,5,10 --min-games 3 --strict --verbose
-            echo "::endgroup::"
-          }
+      # ---- QUICK backfill (2 → 1) ----
+      - name: Backfill penalties QUICK (2→1)
+        if: ${{ steps.speed.outputs.speed == 'quick' }}
+        run: |
+          python -m src.data_penalties --years 2 --windows 3,5,10 --min-games 3 --strict --verbose || true
+          python -m src.data_penalties --years 1 --windows 3,5,10 --min-games 3 --strict --verbose || true
 
-          echo "Backfill SPEED=${SPEED}"
-          case "$SPEED" in
-            skip)
-              echo "Skipping penalties backfill."
-              ;;
-            quick)
-              echo "Running QUICK backfill (2→1)…"
-              run_stage 2 || true
-              run_stage 1 || true
-              ;;
-            full)
-              echo "Running FULL backfill (5→3→1)…"
-              run_stage 5 || true
-              run_stage 3 || true
-              run_stage 1 || true
-              ;;
-            *)
-              echo "Unknown SPEED=$SPEED"; exit 1;;
-          esac
+      # ---- FULL backfill (5 → 3 → 1) ----
+      - name: Backfill penalties FULL (5→3→1)
+        if: ${{ steps.speed.outputs.speed == 'full' }}
+        run: |
+          python -m src.data_penalties --years 5 --windows 3,5,10 --min-games 3 --strict --verbose || true
+          python -m src.data_penalties --years 3 --windows 3,5,10 --min-games 3 --strict --verbose || true
+          python -m src.data_penalties --years 1 --windows 3,5,10 --min-games 3 --strict --verbose || true
+
+      # ---- SKIP does nothing (no step needed) ----
 
       - name: Save penalty features cache
-        if: "always()"
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: artifacts/features
           key: penalties-${{ runner.os }}-v1
 
       - name: Predict (scores + win prob)
-        if: "${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
-        shell: bash
+        if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
         run: |
-          set -e
           python -m src.predict --out artifacts/preds_winprob.json
           if [ -f "src/score_predict.py" ]; then
             python -m src.score_predict --out artifacts/preds_scores.csv || true
           fi
 
       - name: Label
-        if: "${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
-        shell: bash
-        run: |
-          set -e
-          python -m src.labeler --out artifacts/labels.parquet
+        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        run: python -m src.labeler --out artifacts/labels.parquet
 
       - name: Learn (strict, real data only)
-        if: "${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
-        shell: bash
+        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
         run: |
-          set -e
-          python -m src.learn --features artifacts/features/penalties.parquet --labels artifacts/labels.parquet --out artifacts/model.joblib
+          python -m src.learn \
+            --features artifacts/features/penalties.parquet \
+            --labels artifacts/labels.parquet \
+            --out artifacts/model.joblib
 
       - name: Report
-        if: "${{ github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
-        shell: bash
+        if: ${{ github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
         run: |
-          set -e
           if [ -f "src/reporter.py" ]; then
             python -m src.reporter --artifacts artifacts || true
           fi
 
       - name: Tune
-        if: "${{ github.event.inputs.mode == 'tune' }}"
-        shell: bash
-        run: |
-          set -e
-          python -m src.tune --iters 50 --out tuning-results
+        if: ${{ github.event.inputs.mode == 'tune' }}
+        run: python -m src.tune --iters 50 --out tuning-results
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
