@@ -1,101 +1,176 @@
+"""
+Lightweight beat-news feature extractor.
+
+- Pulls RSS feeds for each team (see FEEDS below; you can extend easily).
+- Parses titles + summaries in the last N hours.
+- Uses rule-based patterns to score signals:
+  * qb_out, qb_questionable, star_out, tempo_up, tempo_down, suspension, coach_change
+- Merges with optional manual overrides from news_overrides.json at repo root.
+
+Outputs a DataFrame with columns:
+  team, season, week, news_qb_out, news_qb_quest, news_star_out,
+  news_tempo_up, news_tempo_down, news_suspension, news_coach_change, news_hits
+"""
+
 from __future__ import annotations
-import json
-import os
-from typing import Dict, Any
+import re, json, pathlib, datetime as dt
+from typing import Dict, List, Any
+import feedparser
+from bs4 import BeautifulSoup
 
-# ------------------------------------------------------------
-# News / Video signal adapter (CI-safe, no external calls)
-# ------------------------------------------------------------
-# Sources of signal (all optional; if missing, returns 0.0):
-# 1) store/news_overrides.json      -> {"Team Name": 0.6, "Other Team": -0.4}
-# 2) store/news_cache/<Team>.txt    -> free-form notes (we do simple keyword sentiment)
-#
-# Ranges:
-# - get_team_sentiment() returns a float in [-1.0, +1.0].
-# - You can blend this into spread/total using config weights/caps.
-#
-# Why this design?
-# - It never breaks CI (no HTTP or API keys required).
-# - Lets you hand-enter one-off items from beat writers/videos.
-# - We can later swap in real feeds (Google News API, YouTube Data API, etc.)
-#   by replacing fetchers here without touching the rest of the pipeline.
+from .common import cache_requests
 
-_POS = {
-    "return", "returns", "cleared", "healthy", "upgrade", "upgraded",
-    "probable", "available", "practiced", "starting", "start", "back",
-    "activated", "improved", "improving", "boost", "boosted", "favorable",
-}
-_NEG = {
-    "out", "doubtful", "questionable", "injured", "injury", "surgery",
-    "tear", "broken", "fracture", "hamstring", "ankle", "knee", "concussion",
-    "suspended", "ruled out", "won't play", "won’t play", "not playing",
-    "miss", "missing", "limited", "setback", "downgrade", "downgraded",
+# ---- Minimal starter feed map. Extend freely. ----
+# Format: team name (CFBD-style) -> list of RSS feed URLs
+FEEDS: Dict[str, List[str]] = {
+    # Examples; add your teams’ beat feeds here:
+    # "Arizona State": [
+    #   "https://www.azcentral.com/arizonastateuniversity/asu-football/rss/",
+    #   "https://www.houseofsparky.com/rss/index.xml",
+    # ],
+    # "Texas State": [
+    #   "https://www.statesman.com/sports/texas-state/rss/",
+    # ],
 }
 
-def _load_overrides() -> Dict[str, float]:
-    path = os.path.join("store", "news_overrides.json")
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-        # clamp to [-1,1]
-        out = {}
-        for k, v in data.items():
+# Simple keywords per signal (lower-cased match)
+KW = {
+    "qb_out":        [r"\bqb\b.*\bout\b", r"\bstarting quarterback\b.*\bout\b"],
+    "qb_quest":      [r"\bqb\b.*\bquestionable\b", r"\bprobable\b", r"\bgame[- ]time decision\b"],
+    "star_out":      [r"\b(all-american|star|top|leading|starting)\b.*\bout\b", r"\bwr\b.*\bout\b", r"\brb\b.*\bout\b", r"\blt\b.*\bout\b"],
+    "tempo_up":      [r"\bno-huddle\b", r"\bup[- ]tempo\b", r"\bfaster pace\b", r"\bplays per minute up\b"],
+    "tempo_down":    [r"\bslow(ing)? down\b", r"\bmilk(ing)? clock\b", r"\b(ball control|ground game)\b"],
+    "suspension":    [r"\bsuspend(ed|sion)\b", r"\bineligible\b"],
+    "coach_change":  [r"\b(coach|coordinator)\b.*\b(out|fired|resign|hired|new)\b"],
+}
+
+def _now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+def _clean_html(text: str) -> str:
+    text = text or ""
+    soup = BeautifulSoup(text, "html.parser")
+    return soup.get_text(" ", strip=True)
+
+def _score_signals(text: str) -> Dict[str, int]:
+    t = text.lower()
+    scores = {k: 0 for k in KW.keys()}
+    for key, pats in KW.items():
+        for p in pats:
+            if re.search(p, t):
+                scores[key] += 1
+    return scores
+
+def _iso_week_from_date(d: dt.datetime):
+    iso = d.isocalendar()
+    return iso.year, iso.week
+
+def _load_overrides(path: pathlib.Path) -> Dict[str, Any]:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def _apply_overrides(signals, overrides, season: int, week: int):
+    # Overrides structure idea:
+    # {
+    #   "Arizona State": {
+    #     "2025-06": {"qb_out": 1, "tempo_up": 1},
+    #     "all": {"tempo_down": 1}
+    #   }
+    # }
+    for team, spec in overrides.items():
+        team_rows = signals["team"] == team
+        if not team_rows.any():
+            continue
+        # specific YYYY-WW
+        key = f"{season}-{week:02d}"
+        if key in spec:
+            for k, v in spec[key].items():
+                if k in signals.columns:
+                    signals.loc[team_rows, k] = v
+        # global to all weeks
+        if "all" in spec:
+            for k, v in spec["all"].items():
+                if k in signals.columns:
+                    signals.loc[team_rows, k] = v
+    return signals
+
+def collect_for_week(teams: List[str], hours_back: int = 168) -> List[Dict[str, Any]]:
+    cache_requests()
+    cutoff = _now_utc() - dt.timedelta(hours=hours_back)
+    season, week = _iso_week_from_date(_now_utc())
+
+    rows = []
+    for team in teams:
+        total_hits = 0
+        agg = {k: 0 for k in KW.keys()}
+
+        for url in FEEDS.get(team, []):
             try:
-                x = float(v)
-                if x > 1.0: x = 1.0
-                if x < -1.0: x = -1.0
-                out[str(k)] = x
+                feed = feedparser.parse(url)
             except Exception:
                 continue
-        return out
-    except Exception as e:
-        print(f"⚠️ failed to read news_overrides.json: {e}")
-        return {}
+            for e in feed.entries:
+                # published_parsed may be missing; keep it if text matches anyway but prefer recent
+                published = None
+                if "published_parsed" in e and e.published_parsed:
+                    published = dt.datetime(*e.published_parsed[:6], tzinfo=dt.timezone.utc)
+                elif "updated_parsed" in e and e.updated_parsed:
+                    published = dt.datetime(*e.updated_parsed[:6], tzinfo=dt.timezone.utc)
 
-def _score_free_text(text: str) -> float:
-    if not text:
-        return 0.0
-    t = text.lower()
-    pos = sum(1 for w in _POS if w in t)
-    neg = sum(1 for w in _NEG if w in t)
-    if pos == 0 and neg == 0:
-        return 0.0
-    # normalize to [-1,1]
-    s = (pos - neg) / max(1.0, pos + neg)
-    if s > 1.0: s = 1.0
-    if s < -1.0: s = -1.0
-    return s
+                if published and published < cutoff:
+                    continue
 
-def _load_cache_text(team: str) -> str:
-    # store/news_cache/<Team>.txt
-    cache_dir = os.path.join("store", "news_cache")
-    path = os.path.join(cache_dir, f"{team}.txt")
-    if not os.path.exists(path):
-        return ""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
+                title = _clean_html(getattr(e, "title", ""))
+                summary = _clean_html(getattr(e, "summary", ""))
+                text = f"{title} {summary}".strip()
+                if not text:
+                    continue
 
-def get_team_sentiment(team: str, cfg: Dict[str, Any]) -> float:
-    """
-    Returns a sentiment score in [-1, +1] for a given team.
-    Priority: overrides JSON (explicit) > cached text (keyword score) > 0.0
-    Respects cfg["news"]["enabled"] (if explicitly false -> 0.0).
-    """
-    news_cfg = (cfg.get("news") or {})
-    if news_cfg.get("enabled") is False:
-        return 0.0
+                sc = _score_signals(text)
+                if sum(sc.values()) > 0:
+                    total_hits += 1
+                for k, v in sc.items():
+                    agg[k] += v
 
-    if not team:
-        return 0.0
+        row = {
+            "team": team,
+            "season": season,
+            "week": week,
+            "news_hits": total_hits,
+            "news_qb_out": agg["qb_out"],
+            "news_qb_quest": agg["qb_quest"],
+            "news_star_out": agg["star_out"],
+            "news_tempo_up": agg["tempo_up"],
+            "news_tempo_down": agg["tempo_down"],
+            "news_suspension": agg["suspension"],
+            "news_coach_change": agg["coach_change"],
+        }
+        rows.append(row)
+    return rows
 
-    overrides = _load_overrides()
-    if team in overrides:
-        return float(overrides[team])
+def build_signals_df(all_teams: List[str], hours_back: int, min_conf: float, overrides_path: str = "news_overrides.json"):
+    import pandas as pd
+    rows = collect_for_week(all_teams, hours_back)
+    df = pd.DataFrame(rows)
 
-    txt = _load_cache_text(team)
-    return _score_free_text(txt)
+    # Normalize counts to [0,1] confidence by simple squashing (1 hit -> 0.6, 2 -> 0.8, 3+ -> 1.0)
+    def squash(x): 
+        return 1.0 if x >= 3 else (0.8 if x == 2 else (0.6 if x == 1 else 0.0))
+
+    for col in ["news_qb_out","news_qb_quest","news_star_out","news_tempo_up","news_tempo_down","news_suspension","news_coach_change"]:
+        df[col] = df[col].apply(squash)
+        df.loc[df[col] < min_conf, col] = 0.0
+
+    # Apply manual overrides if present
+    overrides = _load_overrides(pathlib.Path(overrides_path))
+    if not df.empty and overrides:
+        # season/week already set to "now" week; overrides will target that.
+        season = int(df["season"].iloc[0])
+        week = int(df["week"].iloc[0])
+        df = _apply_overrides(df, overrides, season, week)
+
+    return df
