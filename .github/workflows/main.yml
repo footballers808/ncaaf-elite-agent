@@ -28,16 +28,16 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       PYTHONDONTWRITEBYTECODE: "1"
 
-      # CFBD throttling defaults (steps may override)
+      # CFBD throttle knobs (increase if you still hit limits)
       CFBD_API_KEY:        ${{ secrets.CFBD_API_KEY }}
-      CFBD_MIN_SLEEP_MS:   "1000"
-      CFBD_MAX_RETRIES:    "12"
-      CFBD_BACKOFF_BASE_S: "2.0"
+      CFBD_MIN_SLEEP_MS:   "2000"
+      CFBD_MAX_RETRIES:    "20"
+      CFBD_BACKOFF_BASE_S: "2.2"
 
       # Email (optional)
       SMTP_HOST:     ${{ secrets.SMTP_HOST }}
@@ -103,22 +103,36 @@ jobs:
             echo "No validate script found; skipping."
           fi
 
-      # ---------- WARMUP (lighter + quick retries) ----------
-      - name: Build penalty features (warmup)
-        if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'backtest' || github.event.inputs.mode == 'tune' }}
-        env:
-          CFBD_MAX_RETRIES: "3"
-          CFBD_MIN_SLEEP_MS: "1500"
+      # ---------- STRICT FEATURE BACKFILL ----------
+      - name: Backfill penalties (strict, staged 5→3→1)
+        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'backtest' }}
         run: |
           set -e
-          tries=0
-          until [ $tries -ge 1 ]
-          do
-            python -m src.data_penalties --years 1 --windows 3,5,10 && break
-            tries=$((tries+1))
-            echo "Warmup retry ${tries}/1..."
-            sleep 10
-          done || true
+          mkdir -p artifacts/features
+
+          build_stage () {
+            YEARS=$1
+            echo "== Building penalty features for last ${YEARS} season(s) =="
+            tries=0
+            until [ $tries -ge 3 ]
+            do
+              python -m src.data_penalties --years ${YEARS} --windows 3,5,10 && return 0
+              tries=$((tries+1))
+              echo "Retry ${tries}/3 for years=${YEARS}..."
+              sleep $(( 20 + 10*tries ))
+            done
+            return 1
+          }
+
+          # Oldest→newest reduces rate-limit spikes
+          build_stage 5 || true
+          build_stage 3 || true
+          build_stage 1 || true
+
+          if [ ! -f artifacts/features/penalties.parquet ]; then
+            echo "ERROR: penalties.parquet missing after strict backfill; aborting."
+            exit 1
+          fi
 
       - name: Save penalty features cache
         if: always()
@@ -128,13 +142,15 @@ jobs:
           key: penalties-${{ runner.os }}-v1
 
       # ---------- MODES ----------
-      - name: Predict
+      - name: Predict (scores + win prob)
         if: ${{ github.event.inputs.mode == 'predict' }}
         run: |
-          python -m src.predict --week "${{ github.event.inputs.week }}" --out artifacts/predictions.csv
-          python -m src.odds   --week "${{ github.event.inputs.week }}" --out artifacts/market_lines.csv || true
-          python -m src.edges  --pred artifacts/predictions.csv --lines artifacts/market_lines.csv --out artifacts/edges.csv || true
-          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html || true
+          python -m src.predict --week "${{ github.event.inputs.week }}" --out artifacts/win_predictions.csv || true
+          python -m src.score_predict --week "${{ github.event.inputs.week }}" --out artifacts/score_predictions.csv
+          python -m src.report --week "${{ github.event.inputs.week }}" \
+            --pred artifacts/win_predictions.csv \
+            --edges artifacts/score_predictions.csv \
+            --out artifacts/report.html || true
 
       - name: Label
         if: ${{ github.event.inputs.mode == 'label' }}
@@ -142,60 +158,35 @@ jobs:
           python -m src.label --week "${{ github.event.inputs.week }}" --out artifacts/labels.csv
 
       # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      #                            LEARN (FAST)
+      #                            LEARN (STRICT)
       # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      - name: Learn (fast)
+      - name: Learn (strict, real data only)
         if: ${{ github.event.inputs.mode == 'learn' }}
-        env:
-          # Keep Learn responsive; raise later for deeper history
-          CFBD_MAX_RETRIES: "6"
-          CFBD_MIN_SLEEP_MS: "1500"
         run: |
           set -e
-
-          build_features () {
-            YEARS=$1
-            echo "== Building penalty features (years=${YEARS}) =="
-            tries=0
-            until [ $tries -ge 2 ]
-            do
-              python -m src.data_penalties --years ${YEARS} --windows 3,5,10 && return 0
-              tries=$((tries+1))
-              echo "Retry ${tries}/2 for years=${YEARS}..."
-              sleep 20
-            done
-            return 1
-          }
-
-          # Quick attempt: 1 season only (fastest)
-          if [ ! -f artifacts/features/penalties.parquet ]; then build_features 1 || true; fi
-
-          # If still nothing (rate-limited), create an offline placeholder so training can run
-          if [ ! -f artifacts/features/penalties.parquet ]; then
-            echo "No penalties.parquet yet; creating offline placeholder."
-            python -m src.data_penalties --years 1 --windows 3,5,10 --offline
-          fi
-
-          # Train (smaller lookback for speed; bump to 5+ later)
-          python -m src.learn --years 3 --save artifacts/model.joblib
+          # Train win-prob model (classification) on 5 seasons
+          python -m src.learn --years 5 --save artifacts/model_cls.joblib --features artifacts/features/penalties.parquet
+          # Train score models (home & away points) on 5 seasons
+          python -m src.score_learn --years 5 \
+            --features artifacts/features/penalties.parquet \
+            --save-home artifacts/model_homepts.joblib \
+            --save-away artifacts/model_awaypts.joblib \
+            --metrics artifacts/score_metrics.json
 
       - name: Report
         if: ${{ github.event.inputs.mode == 'report' }}
         run: |
-          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/predictions.csv --edges artifacts/edges.csv --out artifacts/report.html
+          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/win_predictions.csv --edges artifacts/score_predictions.csv --out artifacts/report.html
 
       - name: Backtest
         if: ${{ github.event.inputs.mode == 'backtest' }}
-        env:
-          BACKTEST_STRICT: "0"
         run: |
-          python -u -m src.backtest --years 2 --season-type regular --out artifacts/backtest.json
+          python -u -m src.backtest --years 3 --season-type regular --out artifacts/backtest.json
 
       - name: Tune
         if: ${{ github.event.inputs.mode == 'tune' }}
         env:
-          TUNE_ITERS: "8"
-          TUNE_FAIL_OPEN: "1"
+          TUNE_ITERS: "12"
         run: |
           python -m src.tune
 
@@ -210,19 +201,6 @@ jobs:
             tuning-results/**
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Commit merged tuned config to branch
-        if: ${{ github.event.inputs.commit_best == 'true' && hashFiles('config.merged.yaml') != '' }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          BR="auto/best-config-${{ github.run_id }}"
-          git checkout -b "$BR"
-          cp config.merged.yaml config.yaml
-          git add config.yaml
-          git commit -m "chore: apply best_config.yaml (run ${{ github.run_id }})"
-          git push -u origin "$BR"
-          echo "PR step created. Open it to merge the tuned config."
 
       - name: Email report
         if: ${{ env.SMTP_HOST != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
@@ -239,16 +217,11 @@ jobs:
           convert_markdown: false
           attachments: |
             artifacts/report.html
-            artifacts/edges.csv
-            artifacts/predictions.csv
+            artifacts/score_predictions.csv
 
       - name: Slack webhook
         if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
         run: |
-          if [ -f artifacts/edges.csv ]; then
-            MSG="Edges ready for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
-          else
-            MSG="No edges.csv found for ${{ github.event.inputs.mode }} (run ${{ github.run_id }})"
-          fi
+          MSG="Run ${{ github.run_id }} finished – mode=${{ github.event.inputs.mode }}"
           curl -X POST -H "Content-type: application/json" \
             --data "{\"text\":\"${MSG}\"}" "$SLACK_WEBHOOK"
