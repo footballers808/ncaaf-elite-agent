@@ -23,9 +23,6 @@ def games(year: int, season_type: str="regular", week: Optional[int]=None):
     if week is not None: p["week"] = week
     return _get("/games", p)
 
-def teams(year: int):
-    return _get("/teams/fbs", {"year": year})
-
 def lines(year: int, season_type: str="regular", week: Optional[int]=None):
     p = {"year": year, "seasonType": season_type}
     if week is not None: p["week"] = week
