@@ -10,7 +10,7 @@ def cache_requests():
     requests_cache.install_cache(
         cache_name=str(cache_dir / "http"),
         backend="sqlite",
-        expire_after=6*3600,  # 6 hours
+        expire_after=6*3600,
     )
 
 def get_env(name: str, default: str=""):
