@@ -4,51 +4,33 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Mode to run"
-        required: true
-        default: "learn"
-      week:
-        description: "ISO week (yyyy-ww) or 'auto'"
-        required: false
-        default: "auto"
-      commit_best:
-        description: "If 'true', open a PR applying the merged tuned config"
-        required: false
-        default: "false"
+        description: "Run mode"
+        default: auto
+        type: choice
+        options: [auto, predict, learn, backtest, tune]
+      speed:
+        description: "Backfill speed (quick=2→1, full=5→3→1, skip=none). Cron defaults to full."
+        default: quick
+        type: choice
+        options: [quick, full, skip]
+  # Nightly full refresh (runs with speed=full automatically)
   schedule:
-    - cron: "0 13 * * 1"   # Mondays 13:00 UTC
+    - cron: "20 06 * * *" # 06:20 UTC daily — change if you want
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ncaaf-elite-agent-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  run:
+  ncaaf:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 360
     env:
-      PYTHONDONTWRITEBYTECODE: "1"
-
-      # CFBD throttle knobs (increase if you still hit limits)
-      CFBD_API_KEY:        ${{ secrets.CFBD_API_KEY }}
-      CFBD_MIN_SLEEP_MS:   "2000"
-      CFBD_MAX_RETRIES:    "20"
-      CFBD_BACKOFF_BASE_S: "2.2"
-
-      # Email (optional)
-      SMTP_HOST:     ${{ secrets.SMTP_HOST }}
-      SMTP_PORT:     ${{ secrets.SMTP_PORT }}
-      SMTP_USER:     ${{ secrets.SMTP_USER }}
-      SMTP_PASS:     ${{ secrets.SMTP_PASS }}
-      FROM_ADDR:     ${{ secrets.FROM_ADDR }}
-      TO_ADDRS:      ${{ secrets.TO_ADDRS }}
-
-      # Slack (optional)
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -62,77 +44,88 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install -U pip
+          set -e
+          pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---------- CACHES ----------
+      # Optional cache for CFBD/requests (helps when backfilling)
       - name: Cache CFBD responses
         uses: actions/cache@v4
         with:
-          path: .cache/cfbd
-          key: cfbd-${{ runner.os }}-v1
-          restore-keys: |
-            cfbd-${{ runner.os }}-
+          path: |
+            ~/.cache/http
+            ~/.cache/pip
+            ~/.cache/requests
+            .cache
+          key: cfbd-http-${{ runner.os }}-v1
 
+      # --- Feature cache (penalties parquet) ---
       - name: Restore penalty features cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: artifacts/features
           key: penalties-${{ runner.os }}-v1
           restore-keys: |
             penalties-${{ runner.os }}-
 
-      # ---------- CONFIG CHECK ----------
+      # Validate config; if tuned config exists, use it
       - name: Apply tuned config (if present) + validate
-        if: ${{ github.event.inputs.mode != 'tune' && github.event.inputs.mode != '' }}
-        run: |
-          if [ -f tuning-results/best_config.yaml ]; then
-            echo "Found tuning-results/best_config.yaml"
-            if [ -f tools/apply_best_config.py ]; then
-              python tools/apply_best_config.py
-              cp config.merged.yaml config.yaml || true
-            else
-              echo "No apply_best_config.py; skipping auto-merge."
-            fi
-          else
-            echo "No tuning-results/best_config.yaml; using repo config.yaml"
-          fi
-          if [ -f tools/validate_config.py ]; then
-            python tools/validate_config.py
-          else
-            echo "No validate script found; skipping."
-          fi
-
-      # ---------- STRICT FEATURE BACKFILL ----------
-      - name: Backfill penalties (strict, staged 5→3→1)
-        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'backtest' }}
+        shell: bash
         run: |
           set -e
-          mkdir -p artifacts/features
+          if [ -f tuning-results/best_config.yaml ]; then
+            echo "Using tuned config: tuning-results/best_config.yaml"
+            cp tuning-results/best_config.yaml config.yaml
+          else
+            echo "No tuned config; using repo config.yaml"
+          fi
+          # Validate (repo has tools/validate_config.py)
+          python -m tools.validate_config
+          echo "validate_config done."
 
-          build_stage () {
-            YEARS=$1
-            echo "== Building penalty features for last ${YEARS} season(s) =="
-            tries=0
-            until [ $tries -ge 3 ]
-            do
-              python -m src.data_penalties --years ${YEARS} --windows 3,5,10 && return 0
-              tries=$((tries+1))
-              echo "Retry ${tries}/3 for years=${YEARS}..."
-              sleep $(( 20 + 10*tries ))
-            done
-            return 1
+      # ------------- BACKFILL (switchable) ----------------
+      - name: Backfill penalties (switchable: quick/full/skip)
+        shell: bash
+        run: |
+          set -e
+
+          SPEED="${{ github.event.inputs.speed }}"
+          # Cron defaults to FULL if not passed
+          if [ -z "$SPEED" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            SPEED="full"
+          fi
+          # Manual default is QUICK
+          if [ -z "$SPEED" ]; then
+            SPEED="quick"
+          fi
+
+          run_stage () {
+            local yrs="$1"
+            echo "::group::penalties years=${yrs}"
+            # -u = unbuffered; --verbose prints per-year progress
+            python -u -m src.data_penalties --years "${yrs}" --windows 3,5,10 --min-games 3 --strict --verbose
+            echo "::endgroup::"
           }
 
-          # Oldest→newest reduces rate-limit spikes
-          build_stage 5 || true
-          build_stage 3 || true
-          build_stage 1 || true
-
-          if [ ! -f artifacts/features/penalties.parquet ]; then
-            echo "ERROR: penalties.parquet missing after strict backfill; aborting."
-            exit 1
-          fi
+          echo "Backfill SPEED=${SPEED}"
+          case "$SPEED" in
+            skip)
+              echo "Skipping penalties backfill (will rely on cache if present)."
+              ;;
+            quick)
+              echo "Running QUICK backfill (2→1)…"
+              run_stage 2 || true
+              run_stage 1 || true
+              ;;
+            full)
+              echo "Running FULL backfill (5→3→1)…"
+              run_stage 5 || true
+              run_stage 3 || true
+              run_stage 1 || true
+              ;;
+            *)
+              echo "Unknown SPEED=$SPEED"; exit 1;;
+          esac
 
       - name: Save penalty features cache
         if: always()
@@ -141,58 +134,57 @@ jobs:
           path: artifacts/features
           key: penalties-${{ runner.os }}-v1
 
-      # ---------- MODES ----------
+      # ----------------- PREDICT -----------------
       - name: Predict (scores + win prob)
-        if: ${{ github.event.inputs.mode == 'predict' }}
-        run: |
-          python -m src.predict --week "${{ github.event.inputs.week }}" --out artifacts/win_predictions.csv || true
-          python -m src.score_predict --week "${{ github.event.inputs.week }}" --out artifacts/score_predictions.csv
-          python -m src.report --week "${{ github.event.inputs.week }}" \
-            --pred artifacts/win_predictions.csv \
-            --edges artifacts/score_predictions.csv \
-            --out artifacts/report.html || true
-
-      - name: Label
-        if: ${{ github.event.inputs.mode == 'label' }}
-        run: |
-          python -m src.label --week "${{ github.event.inputs.week }}" --out artifacts/labels.csv
-
-      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      #                            LEARN (STRICT)
-      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      - name: Learn (strict, real data only)
-        if: ${{ github.event.inputs.mode == 'learn' }}
+        if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        shell: bash
         run: |
           set -e
-          # Train win-prob model (classification) on 5 seasons
-          python -m src.learn --years 5 --save artifacts/model_cls.joblib --features artifacts/features/penalties.parquet
-          # Train score models (home & away points) on 5 seasons
-          python -m src.score_learn --years 5 \
-            --features artifacts/features/penalties.parquet \
-            --save-home artifacts/model_homepts.joblib \
-            --save-away artifacts/model_awaypts.joblib \
-            --metrics artifacts/score_metrics.json
+          # Win probabilities
+          python -m src.predict --out artifacts/preds_winprob.json
+          # Exact score predictions (if your repo provides it)
+          if [ -f "src/score_predict.py" ]; then
+            python -m src.score_predict --out artifacts/preds_scores.csv || true
+          fi
 
+      # ----------------- LABEL -------------------
+      - name: Label
+        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          set -e
+          python -m src.labeler --out artifacts/labels.parquet
+
+      # ----------------- LEARN -------------------
+      - name: Learn (strict, real data only)
+        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          set -e
+          # Train the model using the latest features/labels
+          python -m src.learn --features artifacts/features/penalties.parquet --labels artifacts/labels.parquet --out artifacts/model.joblib
+
+      # ----------------- REPORT ------------------
       - name: Report
-        if: ${{ github.event.inputs.mode == 'report' }}
+        if: ${{ github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        shell: bash
         run: |
-          python -m src.report --week "${{ github.event.inputs.week }}" --pred artifacts/win_predictions.csv --edges artifacts/score_predictions.csv --out artifacts/report.html
+          set -e
+          # Email + Slack are optional; your reporter can no-op if not configured
+          if [ -f "src/reporter.py" ]; then
+            python -m src.reporter --artifacts artifacts || true
+          fi
 
-      - name: Backtest
-        if: ${{ github.event.inputs.mode == 'backtest' }}
-        run: |
-          python -u -m src.backtest --years 3 --season-type regular --out artifacts/backtest.json
-
+      # (Optional) Tune block – keep only if you use it
       - name: Tune
         if: ${{ github.event.inputs.mode == 'tune' }}
-        env:
-          TUNE_ITERS: "12"
+        shell: bash
         run: |
-          python -m src.tune
+          set -e
+          python -m src.tune --iters 50 --out tuning-results
 
-      # ---------- ARTIFACTS ----------
+      # Upload artifacts for debugging/inspection
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-artifacts
@@ -200,28 +192,3 @@ jobs:
             artifacts/**
             tuning-results/**
           if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Email report
-        if: ${{ env.SMTP_HOST != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ env.SMTP_HOST }}
-          server_port: ${{ env.SMTP_PORT }}
-          username: ${{ env.SMTP_USER }}
-          password: ${{ env.SMTP_PASS }}
-          subject: "NCAAF Agent – ${{ github.event.inputs.mode }} – run ${{ github.run_id }}"
-          from: ${{ env.FROM_ADDR }}
-          to: ${{ env.TO_ADDRS }}
-          content_type: text/html
-          convert_markdown: false
-          attachments: |
-            artifacts/report.html
-            artifacts/score_predictions.csv
-
-      - name: Slack webhook
-        if: ${{ env.SLACK_WEBHOOK != '' && (github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'report') }}
-        run: |
-          MSG="Run ${{ github.run_id }} finished – mode=${{ github.event.inputs.mode }}"
-          curl -X POST -H "Content-type: application/json" \
-            --data "{\"text\":\"${MSG}\"}" "$SLACK_WEBHOOK"
