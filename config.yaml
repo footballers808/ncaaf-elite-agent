@@ -5,10 +5,6 @@ injury_window_days: 10
 edge_threshold_spread: 1.5
 edge_threshold_total: 2.0
 
-news_enabled: true
-news_hours_back: 168      # look back one week (beats post often midweek)
-news_min_confidence: 0.5  # signals below this are dropped (0–1)
-
 weather_enabled: true
 weather_vars: [temp, wind, precip]
 weather_hours_before: 3
