@@ -1,23 +1,18 @@
-# Feature windows
 form_games: 4
 pace_games: 4
 injury_window_days: 10
 
-# Market edge settings
 edge_threshold_spread: 1.5
 edge_threshold_total: 2.0
 
-# Weather (Open-Meteo; no API key needed)
 weather_enabled: true
 weather_vars: [temp, wind, precip]
 weather_hours_before: 3
 
-# Modeling
 model:
   regressor: random_forest
   n_estimators: 400
   max_depth: 12
   random_state: 42
 
-# Labeling
 season_type: regular
