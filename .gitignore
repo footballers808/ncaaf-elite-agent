@@ -1,40 +1,39 @@
-# ===== Python =====
+# ---- Python basics ----
 __pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-.build/
-dist/
-build/
+*.pyc
 *.pyo
 *.pyd
+*.pyc.py
+*.egg-info/
+.dist/
+.build/
+.pytest_cache/
 
-# ===== Environments / tooling =====
+# Virtualenvs
 .venv/
 venv/
-.env
-.envrc
-.python-version
-pytest.ini
-.mypy_cache/
-.pytest_cache/
-.coverage
-coverage.xml
+env/
 
-# ===== Editors / OS =====
+# macOS / editors
+.DS_Store
 .idea/
 .vscode/
-.DS_Store
-Thumbs.db
 
-# ===== Project artifacts (kept out of git; Actions will upload them) =====
+# ---- Project outputs (safe to ignore) ----
 artifacts/
-tuning-results/
 reports/
 
-# ===== CFBD HTTP cache (for Option C) =====
+# If you DO want PRs to include tuned configs, don't ignore this folder:
+# (uncomment the next line ONLY if you never want tuned results committed)
+# tuning-results/
+
+# If you prefer to ignore the folder but still allow best_config.yaml, use:
+# tuning-results/*
+# !tuning-results/best_config.yaml
+
+# ---- CFBD HTTP cache (local dev) ----
 .cache/
 .cache/cfbd/
 
-# ===== Jupyter (if any) =====
+# Jupyter (if ever used)
 .ipynb_checkpoints/
