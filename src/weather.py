@@ -1,11 +1,9 @@
-from typing import Optional, Tuple
 import datetime as dt
 import requests
 from .common import cache_requests
 
 def historical_hour(lat: float, lon: float, when_utc: dt.datetime):
     cache_requests()
-    # Pull the day of the game (UTC) and take hours leading up to kickoff
     start = (when_utc - dt.timedelta(hours=6)).strftime("%Y-%m-%dT%H:00")
     end   = (when_utc + dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:00")
     url = "https://archive-api.open-meteo.com/v1/archive"
@@ -24,16 +22,12 @@ def summarize(lat: float, lon: float, kickoff_utc: dt.datetime, hours_before: in
     data = historical_hour(lat, lon, kickoff_utc)
     if not data or "hourly" not in data: return None
     hourly = data["hourly"]
-    times = hourly.get("time", [])
     temps = hourly.get("temperature_2m", [])
     winds = hourly.get("wind_speed_10m", [])
     precs = hourly.get("precipitation", [])
-    # average last N hours before kickoff
     def avg_last(arr):
         if not arr: return None
-        return sum(arr[-hours_before-1:-1]) / max(1, min(hours_before, len(arr)-1))
-    return {
-        "temp": avg_last(temps),
-        "wind": avg_last(winds),
-        "precip": avg_last(precs),
-    }
+        n = min(hours_before, max(0, len(arr)-1))
+        if n <= 0: return None
+        return sum(arr[-n-1:-1]) / n
+    return {"temp": avg_last(temps), "wind": avg_last(winds), "precip": avg_last(precs)}
