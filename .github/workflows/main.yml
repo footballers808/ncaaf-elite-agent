@@ -5,24 +5,24 @@ on:
     inputs:
       mode:
         description: "Run mode"
-        default: auto
+        default: "auto"
         type: choice
-        options: [auto, predict, learn, backtest, tune]
+        options:
+          - auto
+          - predict
+          - learn
+          - backtest
+          - tune
       speed:
         description: "Backfill speed (quick=2→1, full=5→3→1, skip=none). Cron defaults to full."
-        default: quick
+        default: "quick"
         type: choice
-        options: [quick, full, skip]
-  # Nightly full refresh (runs with speed=full automatically)
+        options:
+          - quick
+          - full
+          - skip
   schedule:
-    - cron: "20 06 * * *" # 06:20 UTC daily — change if you want
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ncaaf-elite-agent-${{ github.ref }}
-  cancel-in-progress: false
+    - cron: "20 06 * * *"
 
 jobs:
   ncaaf:
@@ -45,10 +45,10 @@ jobs:
       - name: Install dependencies
         run: |
           set -e
+          python -V
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Optional cache for CFBD/requests (helps when backfilling)
       - name: Cache CFBD responses
         uses: actions/cache@v4
         with:
@@ -59,7 +59,6 @@ jobs:
             .cache
           key: cfbd-http-${{ runner.os }}-v1
 
-      # --- Feature cache (penalties parquet) ---
       - name: Restore penalty features cache
         uses: actions/cache/restore@v4
         with:
@@ -68,7 +67,6 @@ jobs:
           restore-keys: |
             penalties-${{ runner.os }}-
 
-      # Validate config; if tuned config exists, use it
       - name: Apply tuned config (if present) + validate
         shell: bash
         run: |
@@ -79,30 +77,24 @@ jobs:
           else
             echo "No tuned config; using repo config.yaml"
           fi
-          # Validate (repo has tools/validate_config.py)
           python -m tools.validate_config
           echo "validate_config done."
 
-      # ------------- BACKFILL (switchable) ----------------
       - name: Backfill penalties (switchable: quick/full/skip)
         shell: bash
         run: |
           set -e
-
           SPEED="${{ github.event.inputs.speed }}"
-          # Cron defaults to FULL if not passed
           if [ -z "$SPEED" ] && [ "${{ github.event_name }}" = "schedule" ]; then
             SPEED="full"
           fi
-          # Manual default is QUICK
           if [ -z "$SPEED" ]; then
             SPEED="quick"
           fi
 
           run_stage () {
-            local yrs="$1"
+            yrs="$1"
             echo "::group::penalties years=${yrs}"
-            # -u = unbuffered; --verbose prints per-year progress
             python -u -m src.data_penalties --years "${yrs}" --windows 3,5,10 --min-games 3 --strict --verbose
             echo "::endgroup::"
           }
@@ -110,7 +102,7 @@ jobs:
           echo "Backfill SPEED=${SPEED}"
           case "$SPEED" in
             skip)
-              echo "Skipping penalties backfill (will rely on cache if present)."
+              echo "Skipping penalties backfill."
               ;;
             quick)
               echo "Running QUICK backfill (2→1)…"
@@ -128,62 +120,52 @@ jobs:
           esac
 
       - name: Save penalty features cache
-        if: always()
+        if: "always()"
         uses: actions/cache/save@v4
         with:
           path: artifacts/features
           key: penalties-${{ runner.os }}-v1
 
-      # ----------------- PREDICT -----------------
       - name: Predict (scores + win prob)
-        if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        if: "${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
         shell: bash
         run: |
           set -e
-          # Win probabilities
           python -m src.predict --out artifacts/preds_winprob.json
-          # Exact score predictions (if your repo provides it)
           if [ -f "src/score_predict.py" ]; then
             python -m src.score_predict --out artifacts/preds_scores.csv || true
           fi
 
-      # ----------------- LABEL -------------------
       - name: Label
-        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        if: "${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
         shell: bash
         run: |
           set -e
           python -m src.labeler --out artifacts/labels.parquet
 
-      # ----------------- LEARN -------------------
       - name: Learn (strict, real data only)
-        if: ${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        if: "${{ github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
         shell: bash
         run: |
           set -e
-          # Train the model using the latest features/labels
           python -m src.learn --features artifacts/features/penalties.parquet --labels artifacts/labels.parquet --out artifacts/model.joblib
 
-      # ----------------- REPORT ------------------
       - name: Report
-        if: ${{ github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}
+        if: "${{ github.event.inputs.mode == 'auto' || github.event_name == 'schedule' }}"
         shell: bash
         run: |
           set -e
-          # Email + Slack are optional; your reporter can no-op if not configured
           if [ -f "src/reporter.py" ]; then
             python -m src.reporter --artifacts artifacts || true
           fi
 
-      # (Optional) Tune block – keep only if you use it
       - name: Tune
-        if: ${{ github.event.inputs.mode == 'tune' }}
+        if: "${{ github.event.inputs.mode == 'tune' }}"
         shell: bash
         run: |
           set -e
           python -m src.tune --iters 50 --out tuning-results
 
-      # Upload artifacts for debugging/inspection
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
