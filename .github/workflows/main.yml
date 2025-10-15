@@ -134,12 +134,11 @@ PY
           Y=$(date -u +%Y)
           python -m src.labeler --year "$Y" --season-type regular
 
-      # --------- News (Beat writer enrichment) ----------
-      - name: News enrichment (optional, safe if no file)
+      # --------- News (Beat writer enrichment, optional) ----------
+      - name: News enrichment (optional)
         if: ${{ contains(fromJSON('["auto","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
-          # If no input file, create an empty CSV so step always succeeds
           test -f data/news_feed.csv || { mkdir -p data; echo "team,text" > data/news_feed.csv; }
           python -m src.news --in data/news_feed.csv --out artifacts/features/news.parquet
 
