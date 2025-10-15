@@ -18,7 +18,7 @@ on:
         required: true
         default: "false"
   schedule:
-    - cron: "23 11 * * 5" # Fridays 11:23 UTC
+    - cron: "23 11 * * 5"
   push:
     branches: [ main ]
     paths:
@@ -86,6 +86,15 @@ jobs:
           restore-keys: |
             ${{ env.PENALTY_CACHE_SCOPE }}-
 
+      - name: Sanity import check (fails fast if paths are wrong)
+        run: |
+          python - <<'PY'
+import importlib
+for m in ["src.tools.validate_config","src.data_penalties","src.labeler","src.learn","src.predict","src.reporter"]:
+    importlib.import_module(m)
+print("imports ok")
+PY
+
       - name: Apply tuned config if present + validate
         run: |
           set -e
@@ -133,7 +142,7 @@ PY
           echo "Scoring ISO week: $ISO"
           python -m src.predict --iso-week "$ISO" --features artifacts/features/penalties.parquet --out artifacts/preds.parquet
 
-      # --------- Label (NO --out) ----------
+      # --------- Label ----------
       - name: Label
         if: ${{ contains(fromJSON('["auto","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
         run: |
