@@ -11,7 +11,13 @@ TARGETS = ["home_score", "away_score"]
 def _build_training(features: pd.DataFrame, labels: pd.DataFrame):
     def pivot_side(df, prefix, side_mask):
         cols = ["game_id","team","pf_mean","pa_mean","pace_mean","injuries_recent",
-                "market_spread","market_total","wx_temp","wx_wind","wx_precip","neutral_site"]
+        "market_spread","market_total",
+        "wx_temp","wx_wind","wx_precip","neutral_site",
+        # news signals (merged by season/week/team)
+        "news_qb_out","news_qb_quest","news_star_out",
+        "news_tempo_up","news_tempo_down","news_suspension","news_coach_change"
+]
+
         x = df.loc[side_mask, cols].copy()
         x = x.rename(columns={c: f"{prefix}_{c}" for c in cols if c != "game_id"})
         return x
