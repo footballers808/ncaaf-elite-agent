@@ -1,4 +1,4 @@
-import argparse, pathlib, yaml, pandas as pd, numpy as np, json
+import argparse, pathlib, yaml, pandas as pd
 from .common import ART, safe_read_parquet
 
 def main():
@@ -8,11 +8,9 @@ def main():
     args = ap.parse_args()
 
     with open("config.yaml","r") as f:
-        cfg = yaml.safe_load(f)
+        _ = yaml.safe_load(f)
 
     P = safe_read_parquet(pathlib.Path(args.preds))
-
-    # If labels exist, compute last-run error snapshot
     labels_path = ART / "labels.parquet"
     err_block = ""
     if labels_path.exists():
@@ -29,7 +27,6 @@ def main():
         err_block,
         "\nTop edges (vs market) will appear here when used with the emailer.\n"
     ]
-
     pathlib.Path(args.out).write_text("".join(lines), encoding="utf-8")
 
 if __name__ == "__main__":
