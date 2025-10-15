@@ -20,8 +20,12 @@ def main():
     F = safe_read_parquet(pathlib.Path(args.features))
     home = F[F["team"]==F["home_team"]]
     away = F[F["team"]==F["away_team"]]
-    X_home = home[["game_id","pf_mean","pa_mean","pace_mean","injuries_recent","market_spread","market_total","wx_temp","wx_wind","wx_precip","neutral_site"]].rename(columns=lambda c: c if c=="game_id" else f"home_{c}")
-    X_away = away[["game_id","pf_mean","pa_mean","pace_mean","injuries_recent","market_spread","market_total","wx_temp","wx_wind","wx_precip","neutral_site"]].rename(columns=lambda c: c if c=="game_id" else f"away_{c}")
+
+    base_cols = ["pf_mean","pa_mean","pace_mean","injuries_recent","market_spread","market_total","wx_temp","wx_wind","wx_precip","neutral_site","news_sentiment","injury_hint","motivation_hint"]
+    base_cols = [c for c in base_cols if c in F.columns]
+
+    X_home = home[["game_id"] + base_cols].rename(columns=lambda c: c if c=="game_id" else f"home_{c}")
+    X_away = away[["game_id"] + base_cols].rename(columns=lambda c: c if c=="game_id" else f"away_{c}")
 
     X = X_home.merge(X_away, on="game_id")
     games = cfbd.games(year, cfg.get("season_type","regular"), week=week)
