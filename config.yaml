@@ -1,7 +1,7 @@
 # Feature windows
-form_games: 4          # how many recent games for rolling form
-pace_games: 4          # rolling pace window
-injury_window_days: 10 # count injuries within X days before game
+form_games: 4
+pace_games: 4
+injury_window_days: 10
 
 # Market edge settings
 edge_threshold_spread: 1.5
@@ -9,12 +9,12 @@ edge_threshold_total: 2.0
 
 # Weather (Open-Meteo; no API key needed)
 weather_enabled: true
-weather_vars: [temp, wind, precip]   # temp(C), wind(m/s), precip(mm)
-weather_hours_before: 3              # average last 3 hours before kickoff
+weather_vars: [temp, wind, precip]
+weather_hours_before: 3
 
 # Modeling
 model:
-  regressor: random_forest           # simple & robust on Actions
+  regressor: random_forest
   n_estimators: 400
   max_depth: 12
   random_state: 42
