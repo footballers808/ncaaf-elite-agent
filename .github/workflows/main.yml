@@ -6,7 +6,7 @@ on:
       mode:
         description: "Mode to run"
         required: true
-        default: "predict"
+        default: "learn"
       week:
         description: "ISO week (yyyy-ww) or 'auto'"
         required: false
@@ -32,7 +32,8 @@ jobs:
 
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      # CFBD throttling defaults (learn/tune can override per-step if desired)
+
+      # CFBD throttling defaults (steps may override)
       CFBD_API_KEY:        ${{ secrets.CFBD_API_KEY }}
       CFBD_MIN_SLEEP_MS:   "1000"
       CFBD_MAX_RETRIES:    "12"
@@ -140,31 +141,43 @@ jobs:
         run: |
           python -m src.label --week "${{ github.event.inputs.week }}" --out artifacts/labels.csv
 
-      - name: Learn
+      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      #                            LEARN (FAST)
+      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      - name: Learn (fast)
         if: ${{ github.event.inputs.mode == 'learn' }}
+        env:
+          # Keep Learn responsive; raise later for deeper history
+          CFBD_MAX_RETRIES: "6"
+          CFBD_MIN_SLEEP_MS: "1500"
         run: |
           set -e
+
           build_features () {
             YEARS=$1
             echo "== Building penalty features (years=${YEARS}) =="
             tries=0
-            until [ $tries -ge 3 ]
+            until [ $tries -ge 2 ]
             do
               python -m src.data_penalties --years ${YEARS} --windows 3,5,10 && return 0
               tries=$((tries+1))
-              echo "Retry ${tries}/3 for years=${YEARS}..."
-              sleep 25
+              echo "Retry ${tries}/2 for years=${YEARS}..."
+              sleep 20
             done
             return 1
           }
+
+          # Quick attempt: 1 season only (fastest)
           if [ ! -f artifacts/features/penalties.parquet ]; then build_features 1 || true; fi
-          if [ ! -f artifacts/features/penalties.parquet ]; then build_features 2 || true; fi
-          if [ ! -f artifacts/features/penalties.parquet ]; then build_features 3 || true; fi
+
+          # If still nothing (rate-limited), create an offline placeholder so training can run
           if [ ! -f artifacts/features/penalties.parquet ]; then
-            echo "ERROR: penalties.parquet still missing after fallbacks."
-            exit 1
+            echo "No penalties.parquet yet; creating offline placeholder."
+            python -m src.data_penalties --years 1 --windows 3,5,10 --offline
           fi
-          python -m src.learn --years 5 --save artifacts/model.joblib
+
+          # Train (smaller lookback for speed; bump to 5+ later)
+          python -m src.learn --years 3 --save artifacts/model.joblib
 
       - name: Report
         if: ${{ github.event.inputs.mode == 'report' }}
