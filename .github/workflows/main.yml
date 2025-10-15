@@ -109,11 +109,7 @@ jobs:
         if: ${{ github.event.inputs.mode == 'predict' || github.event.inputs.mode == 'learn' || github.event.inputs.mode == 'backtest' || github.event.inputs.mode == 'tune' }}
         run: |
           set -e
-          END_YEAR=$(python - <<'PY'
-from datetime import datetime, timezone
-print(datetime.now(timezone.utc).year - 1)
-PY
-)
+          END_YEAR=$(python -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).year - 1)')
           echo "END_YEAR=${END_YEAR}"
 
           tries=0
@@ -151,11 +147,7 @@ PY
         if: ${{ github.event.inputs.mode == 'learn' }}
         run: |
           set -e
-          END_YEAR=$(python - <<'PY'
-from datetime import datetime, timezone
-print(datetime.now(timezone.utc).year - 1)
-PY
-)
+          END_YEAR=$(python -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).year - 1)')
           echo "END_YEAR=${END_YEAR}"
 
           build_features () {
