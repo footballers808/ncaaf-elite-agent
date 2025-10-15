@@ -1,12 +1,10 @@
-import os, time, json, math, pathlib, datetime as dt
-from typing import Dict, Any, Optional
-import requests, requests_cache
+import os, pathlib, datetime as dt
+import requests_cache
 
 ART = pathlib.Path("artifacts")
 ART.mkdir(parents=True, exist_ok=True)
 
 def cache_requests():
-    # Use the same cache location your Actions step restores
     cache_dir = pathlib.Path.home() / ".cache" / "requests_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     requests_cache.install_cache(
@@ -16,8 +14,7 @@ def cache_requests():
     )
 
 def get_env(name: str, default: str=""):
-    v = os.environ.get(name, default)
-    return v
+    return os.environ.get(name, default)
 
 def dt_utc(d: dt.datetime) -> dt.datetime:
     if d.tzinfo is None:
