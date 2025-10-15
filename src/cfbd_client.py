@@ -1,5 +1,5 @@
-import os, time
-from typing import Dict, Any, List, Optional
+import time
+from typing import Dict, Any, Optional
 import requests
 from .common import get_env, cache_requests
 
@@ -42,5 +42,4 @@ def game_stats(year: int, season_type: str="regular", week: Optional[int]=None):
     return _get("/game/statistics", p)
 
 def venues():
-    # lat/lon for weather
     return _get("/venues", {})
