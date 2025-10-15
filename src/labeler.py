@@ -8,22 +8,20 @@ def main():
     ap.add_argument("--season-type", type=str, default="regular")
     args = ap.parse_args()
 
-    # Build labels from completed games
-    df = []
-    games = cfbd.games(args.year, args.season_type)
-    for g in games:
-        if not g.get("completed"): 
+    rows = []
+    for g in cfbd.games(args.year, args.season_type):
+        if not g.get("completed"):
             continue
-        df.append({
+        rows.append({
             "game_id": g["id"],
             "home_team": g["home_team"],
             "away_team": g["away_team"],
             "home_score": g.get("home_points"),
             "away_score": g.get("away_points"),
             "total_actual": (g.get("home_points") or 0) + (g.get("away_points") or 0),
-            "spread_actual": (g.get("away_points") or 0) - (g.get("home_points") or 0) # away - home
+            "spread_actual": (g.get("away_points") or 0) - (g.get("home_points") or 0)
         })
-    labels = pd.DataFrame(df)
+    labels = pd.DataFrame(rows)
     safe_write_parquet(labels, ART / "labels.parquet")
 
 if __name__ == "__main__":
