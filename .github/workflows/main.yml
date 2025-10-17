@@ -124,3 +124,87 @@ jobs:
           fi
           echo "Scoring ISO week: $ISO"
           python -m src.predict --iso-week "$ISO" --features artifacts/features/penalties.parquet --out artifacts/preds.parquet
+
+      # --------- Label ----------
+      - name: Label
+        if: ${{ contains(fromJSON('["auto","learn"]'), inputs.mode) || github.event_name == 'schedule' }}
+        run: |
+          set -e
+          Y=$(date -u +%Y)
+          python -m src.labeler --year "$Y" --season-type regular
+
+      # --------- Optional Beat-writer News ----------
+      - name: News enrichment (optional)
+        if: ${{ contains(fromJSON('["auto","learn"]'), inputs.mode) || github.event_name == 'schedule' }}
+        run: |
+          set -e
+          test -f data/news_feed.csv || { mkdir -p data; echo "team,text" > data/news_feed.csv; }
+          python -m src.news --in data/news_feed.csv --out artifacts/features/news.parquet
+
+      # --------- Learn ----------
+      - name: Learn (strict, real data)
+        if: ${{ contains(fromJSON('["auto","learn"]'), inputs.mode) || github.event_name == 'schedule' }}
+        run: |
+          set -e
+          test -f artifacts/features/penalties.parquet || { echo "missing penalties.parquet"; exit 1; }
+          test -f artifacts/labels.parquet || { echo "missing labels.parquet"; exit 1; }
+          python -m src.learn --features artifacts/features/penalties.parquet --labels artifacts/labels.parquet --out artifacts/model.joblib
+
+      # --------- Report ----------
+      - name: Report
+        if: ${{ contains(fromJSON('["auto","predict","learn"]'), inputs.mode) || github.event_name == 'schedule' }}
+        run: |
+          set -e
+          if [ -f artifacts/preds.parquet ]; then
+            python -m src.reporter --preds artifacts/preds.parquet --out artifacts/report.md
+          else
+            printf "# NCAAF Elite Agent\n\n- run id: %s\n" "$GITHUB_RUN_ID" > artifacts/report.md
+          fi
+
+      # --------- Backtest ----------
+      - name: Backtest
+        if: ${{ inputs.mode == 'backtest' }}
+        run: |
+          set -e
+          python -m src.backtest --years 5 --out artifacts/backtest.json
+          cat artifacts/backtest.json || true
+
+      # --------- Tune ----------
+      - name: Tune
+        if: ${{ inputs.mode == 'tune' }}
+        env:
+          OPTUNA_STORAGE: sqlite:///artifacts/optuna.db
+        run: |
+          set -e
+          python -m src.tune --iters 60 --storage "$OPTUNA_STORAGE" --out-dir tuning-results
+          ls -l tuning-results || true
+
+      # --------- Optional PR ----------
+      - name: Commit merged tuned config to branch
+        if: ${{ inputs.mode == 'tune' && inputs.pr_apply == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if [ -f tuning-results/best_config.yaml ]; then
+            cp tuning-results/best_config.yaml config.yaml
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -b apply-best-config/${GITHUB_RUN_ID}
+            git add config.yaml tuning-results
+            git commit -m "Apply tuned config (run ${GITHUB_RUN_ID})"
+            git push -u origin HEAD
+            gh pr create --fill --title "Apply tuned config (run ${GITHUB_RUN_ID})"
+          else
+            echo "No tuned config found, skipping PR."
+          fi
+
+      - name: Upload artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-artifacts
+          path: |
+            artifacts/**
+            tuning-results/**
+          if-no-files-found: ignore
