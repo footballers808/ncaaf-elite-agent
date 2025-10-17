@@ -1,11 +1,16 @@
 name: Main Run
 
 on:
-  # Run on Fridays (adjust to your preference)
   schedule:
-    - cron: "23 11 * * 5"
-  # Manual trigger
-  workflow_dispatch: {}
+    - cron: "23 11 * * 5"   # weekly; consider leaving this as low-frequency while rate-limited
+  workflow_dispatch:
+    inputs:
+      backfill_years:
+        description: "How many seasons to backfill (0, 1, 3, 5)"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "1", "3", "5"]
 
 permissions:
   contents: write
@@ -18,15 +23,18 @@ env:
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
-  # ---- CFBD auth + rate limiting (tunable) ----
+  # ---- CFBD auth + rate limiting ----
   CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-  CFBD_MAX_RETRIES: "10"          # bump while backfilling; can lower later
-  CFBD_BACKOFF_BASE_SEC: "0.8"    # base backoff
-  CFBD_THROTTLE_MS: "400"         # min gap between calls (ms)
+  CFBD_MAX_RETRIES: "10"
+  CFBD_BACKOFF_BASE_SEC: "0.8"
+  CFBD_THROTTLE_MS: "400"
 
   # ---- Cache scopes ----
   CFBD_CACHE_SCOPE: cfbd-http-v1
   PENALTY_CACHE_SCOPE: penalties-Linux-v1
+
+  # derive years from dispatch input (default 0 when not provided)
+  BACKFILL_YEARS: ${{ inputs.backfill_years || '0' }}
 
 jobs:
   run:
@@ -47,7 +55,6 @@ jobs:
           python -m pip install -U pip wheel
           pip install -r requirements.txt
 
-      # ---- restore HTTP/cache before doing any CFBD calls ----
       - name: Restore CFBD/requests cache
         uses: actions/cache/restore@v4
         with:
@@ -62,20 +69,11 @@ jobs:
         run: |
           python - <<'PY'
           import importlib
-          mods = [
-            "src.tools.validate_config",
-            "src.data_penalties",
-            "src.features",
-            "src.predict",
-            "src.labeler",
-            "src.learn",
-            "src.reporter",
-          ]
-          for m in mods:
-            try:
+          for m in [
+            "src.tools.validate_config","src.data_penalties","src.features",
+            "src.predict","src.labeler","src.learn","src.reporter",
+          ]:
               importlib.import_module(m)
-            except Exception as e:
-              raise SystemExit(f"import failed: {m}: {e}")
           print("imports ok")
           PY
 
@@ -83,24 +81,35 @@ jobs:
         run: |
           echo "CFBD key present: $([ -n "$CFBD_API_KEY" ] && echo yes || echo no)"
           echo "retries=$CFBD_MAX_RETRIES throttle_ms=$CFBD_THROTTLE_MS backoff=$CFBD_BACKOFF_BASE_SEC"
-          echo "---- config.yaml (first 200 chars) ----"
+          echo "backfill_years=${BACKFILL_YEARS}"
           head -c 200 config.yaml || true
           echo
 
       # =========================
-      #   BUILD / BACKFILL
+      #   BACKFILL (OPTIONAL)
       # =========================
-      - name: Backfill penalties (staged 5-3-1)
+      - name: Backfill penalties (optional)
+        if: env.BACKFILL_YEARS != '0'
+        continue-on-error: true
         run: |
           set -e
-          echo "== build penalties: 5 seasons strict =="
-          python -m src.data_penalties --years 5 --windows 3,5,10 --strict
-          echo "== build penalties: 3 seasons strict =="
-          python -m src.data_penalties --years 3 --windows 3,5,10 --strict
-          echo "== build penalties: 1 season strict =="
-          python -m src.data_penalties --years 1 --windows 3,5,10 --strict
+          echo "== requested backfill years: ${BACKFILL_YEARS} =="
+          # staged windows to warm cache while respecting rate limits
+          if [ "${BACKFILL_YEARS}" = "5" ] || [ "${BACKFILL_YEARS}" = "3" ] || [ "${BACKFILL_YEARS}" = "1" ]; then
+            echo "== build penalties: ${BACKFILL_YEARS} seasons =="
+            # Any 429/HTTP errors will bubble as non-zero here, but step is continue-on-error
+            python -m src.data_penalties --years ${BACKFILL_YEARS} --windows 3,5,10 --strict
+          fi
 
-      # Save only AFTER we've generated features to avoid "path not found" cache warnings
+      - name: Explain backfill failure (if any) and proceed if possible
+        if: always()
+        run: |
+          set -e
+          if [ "${{ steps.backfill-penalties.outcome || 'success' }}" = "failure" ]; then
+            echo "::warning::Backfill failed (likely 429 quota). Will continue if features already exist."
+          fi
+
+      # Save features cache only if present
       - name: Save penalty features cache
         if: always()
         uses: actions/cache/save@v4
@@ -111,10 +120,21 @@ jobs:
       # =========================
       #   PREDICT / LABEL / NEWS
       # =========================
+      - name: Ensure features exist
+        run: |
+          if [ ! -f artifacts/features/penalties.parquet ]; then
+            echo "::error::No penalties features found (artifacts/features/penalties.parquet)."
+            echo "Backfill is currently disabled or failed due to quota (429)."
+            echo "Options:"
+            echo "  1) Re-run 'workflow_dispatch' with backfill_years=1 (small) after quota resets;"
+            echo "  2) Upload a cached features artifact into artifacts/features;"
+            echo "  3) Upgrade API plan or wait for monthly reset."
+            exit 1
+          fi
+
       - name: Predict (scores + win prob)
         run: |
           set -e
-          test -f artifacts/features/penalties.parquet || { echo "missing artifacts/features/penalties.parquet"; exit 1; }
           python -m src.predict --features artifacts/features/penalties.parquet --out artifacts/preds.parquet
 
       - name: Label completed games
@@ -127,7 +147,6 @@ jobs:
         run: |
           set -e
           if [ -f data/news_feed.csv ]; then
-            # If you have src/news.py that builds a news parquet, call it here:
             python -m src.news --in data/news_feed.csv --out artifacts/features/news.parquet
           else
             echo "No data/news_feed.csv; skipping news enrichment"
@@ -139,7 +158,6 @@ jobs:
       - name: Learn (strict, real data)
         run: |
           set -e
-          test -f artifacts/features/penalties.parquet || { echo "missing penalties parquet"; exit 1; }
           if [ -f artifacts/labels.parquet ]; then
             python -m src.learn --features artifacts/features/penalties.parquet --labels artifacts/labels.parquet --out artifacts/model.joblib
           else
@@ -155,9 +173,6 @@ jobs:
             printf "# NCAAF Elite Agent\n\n(no predictions this run)\n" > artifacts/report.md
           fi
 
-      # =========================
-      #   UPLOAD ARTIFACTS
-      # =========================
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
