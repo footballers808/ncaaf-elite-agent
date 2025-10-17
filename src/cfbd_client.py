@@ -2,130 +2,90 @@
 from __future__ import annotations
 
 import time
-import math
-import random
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 import requests
 
 from .common import get_env, cache_requests
 
+CFBD_BASE = "https://api.collegefootballdata.com"
 
-CFBD = "https://api.collegefootballdata.com"
+# ---- Tunables come from env (with safe defaults) ----
+_MAX_RETRIES: int = int(get_env("CFBD_MAX_RETRIES", "8"))          # total attempts
+_BACKOFF_BASE: float = float(get_env("CFBD_BACKOFF_BASE_SEC", "0.6"))  # seconds
+_THROTTLE_MS: int = int(get_env("CFBD_THROTTLE_MS", "250"))        # min gap between calls
+_TIMEOUT: int = 30
+
+# single-process simple throttle
+_last_call = [0.0]
 
 
 def _headers() -> Dict[str, str]:
     key = get_env("CFBD_API_KEY", "")
-    if not key:
-        # Allow running in limited/non-key mode (some endpoints still work)
-        return {}
-    return {"Authorization": f"Bearer {key}"}
+    h = {
+        "User-Agent": "ncaaf-elite-agent/1.0 (+github-actions)",
+        "Accept": "application/json",
+    }
+    if key:
+        h["Authorization"] = f"Bearer {key}"
+    return h
 
 
-def _throttle_ms() -> int:
-    """Small inter-request delay to avoid 429s during loops."""
-    try:
-        return max(0, int(get_env("CFBD_THROTTLE_MS", "250")))
-    except Exception:
-        return 250
+def _throttle() -> None:
+    """Ensure at least THROTTLE_MS between consecutive requests."""
+    if _THROTTLE_MS <= 0:
+        return
+    now = time.time()
+    min_gap = _THROTTLE_MS / 1000.0
+    dt = now - _last_call[0]
+    if dt < min_gap:
+        time.sleep(min_gap - dt)
+    _last_call[0] = time.time()
 
 
-def _max_retries() -> int:
-    try:
-        return max(1, int(get_env("CFBD_MAX_RETRIES", "8")))
-    except Exception:
-        return 8
-
-
-def _base_backoff_seconds() -> float:
-    try:
-        return max(0.1, float(get_env("CFBD_BACKOFF_BASE_SEC", "0.6")))
-    except Exception:
-        return 0.6
-
-
-def _sleep(seconds: float) -> None:
-    # Cap to something reasonable in CI
-    time.sleep(min(seconds, 15.0))
-
-
-def _respect_retry_after(resp: requests.Response) -> Optional[float]:
-    """Return seconds to wait if server instructed us via Retry-After."""
-    ra = resp.headers.get("Retry-After")
-    if not ra:
-        return None
-    try:
-        return float(ra)
-    except Exception:
-        return None
+def _sleep_backoff(attempt: int, status: int) -> None:
+    # exp backoff with small linear jitter, cap to 10s
+    delay = min(_BACKOFF_BASE * (2 ** attempt) + 0.05 * attempt, 10.0)
+    # Be a bit more patient on explicit 429
+    if status == 429:
+        delay = max(delay, _BACKOFF_BASE * 2)
+    time.sleep(delay)
 
 
 def _get(path: str, params: Dict[str, Any]) -> Any:
     """
-    Robust GET with:
-      - requests-cache (set up via common.cache_requests())
-      - exponential backoff + jitter
-      - respect Retry-After on 429/5xx
-      - gentle throttle between attempts
+    Robust GET with throttle + retries for 429/5xx.
+    Raises for non-retriable errors.
     """
-    cache_requests()  # enable persistent cache across the job
-    url = f"{CFBD}{path}"
+    cache_requests()  # install requests_cache once per process
+    url = CFBD_BASE + path
+    headers = _headers()
 
-    # Normalize params: requests struggles with None sometimes
-    clean_params: Dict[str, Any] = {k: v for k, v in (params or {}).items() if v is not None}
-
-    session = requests.Session()
-    tries = _max_retries()
-    base = _base_backoff_seconds()
-    for attempt in range(tries):
-        if attempt > 0:
-            # gentle throttle between subsequent attempts
-            _sleep(_throttle_ms() / 1000.0)
-
+    exc: Optional[Exception] = None
+    for attempt in range(_MAX_RETRIES):
         try:
-            r = session.get(url, params=clean_params, headers=_headers(), timeout=30)
-        except requests.RequestException as e:
-            # Backoff on network problems, then retry
-            wait = base * (2 ** attempt) + random.random() * 0.3
-            _sleep(wait)
-            if attempt == tries - 1:
-                raise
-            continue
+            _throttle()
+            r = requests.get(url, params=params, headers=headers, timeout=_TIMEOUT)
 
-        # Cached hits return status_code from original; treat like normal
-        status = r.status_code
+            if r.status_code in (429, 500, 502, 503, 504):
+                _sleep_backoff(attempt, r.status_code)
+                continue  # retry
 
-        if status == 200:
+            r.raise_for_status()
             return r.json()
-
-        # Rate limited: respect Retry-After if provided, else exponential backoff
-        if status == 429:
-            ra = _respect_retry_after(r)
-            if ra is None:
-                ra = base * (2 ** attempt) + random.random() * 0.5
-            _sleep(float(ra))
-            if attempt == tries - 1:
-                r.raise_for_status()
+        except requests.RequestException as e:
+            exc = e
+            # network hiccup: backoff and retry
+            _sleep_backoff(attempt, getattr(e.response, "status_code", 0))
             continue
 
-        # Transient server errors -> retry with backoff
-        if 500 <= status < 600:
-            ra = _respect_retry_after(r)
-            if ra is None:
-                ra = base * (2 ** attempt) + random.random() * 0.5
-            _sleep(float(ra))
-            if attempt == tries - 1:
-                r.raise_for_status()
-            continue
-
-        # Client errors other than 429: fail fast (bad params, etc.)
-        r.raise_for_status()
-
-    # If we somehow exit loop without return/raise, raise generic
-    raise RuntimeError(f"CFBD request failed after {tries} attempts: {url}")
+    # last attempt failed
+    if exc:
+        raise exc
+    raise RuntimeError("CFBD request failed without exception detail")
 
 
-# -------- Public endpoints (best-effort) --------
+# ------------- Public endpoints (best-effort helpers) -----------------
 
 def games(year: int, season_type: str = "regular", week: Optional[int] = None) -> Any:
     p: Dict[str, Any] = {"year": year, "seasonType": season_type}
@@ -134,19 +94,11 @@ def games(year: int, season_type: str = "regular", week: Optional[int] = None) -
     return _get("/games", p)
 
 
-def lines(year: int, week: Optional[int] = None, season_type: str = "regular") -> Any:
+def lines(year: int, season_type: str = "regular", week: Optional[int] = None) -> Any:
     p: Dict[str, Any] = {"year": year, "seasonType": season_type}
     if week is not None:
         p["week"] = week
     return _get("/lines", p)
-
-
-def injuries(year: int, week: Optional[int] = None, season_type: str = "regular") -> Any:
-    # Not always populated, so callers should be tolerant
-    p: Dict[str, Any] = {"year": year, "seasonType": season_type}
-    if week is not None:
-        p["week"] = week
-    return _get("/injuries", p)
 
 
 def game_stats(year: int, season_type: str = "regular", week: Optional[int] = None) -> Any:
@@ -154,6 +106,17 @@ def game_stats(year: int, season_type: str = "regular", week: Optional[int] = No
     if week is not None:
         p["week"] = week
     return _get("/game/statistics", p)
+
+
+def injuries(year: int, week: Optional[int] = None) -> Any:
+    # CFBD injuries aren’t complete for every year; treat as optional
+    p: Dict[str, Any] = {"year": year}
+    if week is not None:
+        p["week"] = week
+    try:
+        return _get("/injuries", p)
+    except Exception:
+        return []
 
 
 def venues() -> Any:
