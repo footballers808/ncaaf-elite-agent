@@ -2,7 +2,7 @@ name: Main Run
 
 on:
   schedule:
-    - cron: "23 11 * * 5"   # weekly; consider leaving this as low-frequency while rate-limited
+    - cron: "23 11 * * 5"
   workflow_dispatch:
     inputs:
       backfill_years:
@@ -33,7 +33,6 @@ env:
   CFBD_CACHE_SCOPE: cfbd-http-v1
   PENALTY_CACHE_SCOPE: penalties-Linux-v1
 
-  # derive years from dispatch input (default 0 when not provided)
   BACKFILL_YEARS: ${{ inputs.backfill_years || '0' }}
 
 jobs:
@@ -89,27 +88,21 @@ jobs:
       #   BACKFILL (OPTIONAL)
       # =========================
       - name: Backfill penalties (optional)
+        id: backfill
         if: env.BACKFILL_YEARS != '0'
         continue-on-error: true
         run: |
           set -e
           echo "== requested backfill years: ${BACKFILL_YEARS} =="
-          # staged windows to warm cache while respecting rate limits
-          if [ "${BACKFILL_YEARS}" = "5" ] || [ "${BACKFILL_YEARS}" = "3" ] || [ "${BACKFILL_YEARS}" = "1" ]; then
-            echo "== build penalties: ${BACKFILL_YEARS} seasons =="
-            # Any 429/HTTP errors will bubble as non-zero here, but step is continue-on-error
-            python -m src.data_penalties --years ${BACKFILL_YEARS} --windows 3,5,10 --strict
-          fi
+          python -m src.data_penalties --years ${BACKFILL_YEARS} --windows 3,5,10 --strict
 
       - name: Explain backfill failure (if any) and proceed if possible
         if: always()
         run: |
-          set -e
-          if [ "${{ steps.backfill-penalties.outcome || 'success' }}" = "failure" ]; then
+          if [ "${{ steps.backfill.outcome || 'success' }}" = "failure" ]; then
             echo "::warning::Backfill failed (likely 429 quota). Will continue if features already exist."
           fi
 
-      # Save features cache only if present
       - name: Save penalty features cache
         if: always()
         uses: actions/cache/save@v4
@@ -118,32 +111,55 @@ jobs:
           key: ${{ env.PENALTY_CACHE_SCOPE }}-${{ github.sha }}
 
       # =========================
-      #   PREDICT / LABEL / NEWS
+      #   FEATURE CHECK & BRANCH
       # =========================
-      - name: Ensure features exist
+      - name: Check features presence
+        id: featcheck
         run: |
-          if [ ! -f artifacts/features/penalties.parquet ]; then
-            echo "::error::No penalties features found (artifacts/features/penalties.parquet)."
-            echo "Backfill is currently disabled or failed due to quota (429)."
-            echo "Options:"
-            echo "  1) Re-run 'workflow_dispatch' with backfill_years=1 (small) after quota resets;"
-            echo "  2) Upload a cached features artifact into artifacts/features;"
-            echo "  3) Upgrade API plan or wait for monthly reset."
-            exit 1
+          if [ -f artifacts/features/penalties.parquet ]; then
+            echo "present=true" >> $GITHUB_OUTPUT
+            echo "Found features."
+          else
+            echo "present=false" >> $GITHUB_OUTPUT
+            echo "No features file found."
           fi
 
+      - name: Write placeholder report (no features)
+        if: steps.featcheck.outputs.present == 'false'
+        run: |
+          mkdir -p artifacts
+          cat > artifacts/report.md <<'MD'
+          # NCAAF Elite Agent
+
+          **No features available.**  
+          Backfill is disabled or failed (429 API quota).  
+          To produce predictions:
+          1. Re-run this workflow with `backfill_years=1` after your CFBD quota resets (or with a higher-limit key).
+          2. Then warm with `3`, then `5` if desired.
+          3. Or upload a cached `artifacts/features/penalties.parquet` from a prior run.
+
+          The rest of the pipeline was skipped automatically to avoid hard failures.
+          MD
+          echo "Wrote placeholder report."
+
+      # =========================
+      #   PREDICT / LABEL / LEARN (only if features present)
+      # =========================
       - name: Predict (scores + win prob)
+        if: steps.featcheck.outputs.present == 'true'
         run: |
           set -e
           python -m src.predict --features artifacts/features/penalties.parquet --out artifacts/preds.parquet
 
       - name: Label completed games
+        if: steps.featcheck.outputs.present == 'true'
         run: |
           set -e
           Y=$(date -u +%Y)
           python -m src.labeler --year "$Y" --season-type regular
 
       - name: News enrichment (optional)
+        if: steps.featcheck.outputs.present == 'true'
         run: |
           set -e
           if [ -f data/news_feed.csv ]; then
@@ -152,10 +168,8 @@ jobs:
             echo "No data/news_feed.csv; skipping news enrichment"
           fi
 
-      # =========================
-      #   LEARN / REPORT
-      # =========================
       - name: Learn (strict, real data)
+        if: steps.featcheck.outputs.present == 'true'
         run: |
           set -e
           if [ -f artifacts/labels.parquet ]; then
@@ -169,7 +183,7 @@ jobs:
           set -e
           if [ -f artifacts/preds.parquet ]; then
             python -m src.reporter --preds artifacts/preds.parquet --out artifacts/report.md
-          else
+          elif [ ! -f artifacts/report.md ]; then
             printf "# NCAAF Elite Agent\n\n(no predictions this run)\n" > artifacts/report.md
           fi
 
