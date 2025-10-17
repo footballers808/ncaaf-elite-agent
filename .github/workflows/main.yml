@@ -18,7 +18,7 @@ on:
         required: true
         default: "false"
   schedule:
-    - cron: "23 11 * * 5"   # Fridays
+    - cron: "23 11 * * 5"  # Fridays
 
 permissions:
   contents: write
@@ -32,6 +32,11 @@ env:
   PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+  EMAIL_TO: ${{ secrets.EMAIL_TO }}
+  EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+  EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+  SMTP_HOST: ${{ secrets.SMTP_HOST }}
+  SMTP_PORT: ${{ secrets.SMTP_PORT }}
   PENALTY_CACHE_SCOPE: penalties-Linux-v1
   CFBD_CACHE_SCOPE: cfbd-http-v1
 
@@ -65,39 +70,34 @@ jobs:
           restore-keys: |
             ${{ env.CFBD_CACHE_SCOPE }}-
 
-      - name: Restore penalty features cache
-        id: penalty-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: artifacts/features
-          key: ${{ env.PENALTY_CACHE_SCOPE }}-${{ github.sha }}
-          restore-keys: |
-            ${{ env.PENALTY_CACHE_SCOPE }}-
-
       - name: Sanity import check
         run: |
           python - <<'PY'
-import importlib
-for m in ["src.tools.validate_config","src.data_penalties","src.labeler","src.learn","src.predict","src.reporter","src.features","src.news"]:
-    importlib.import_module(m)
-print("imports ok")
-PY
+          import importlib
+          for m in ["src.common","src.cfbd_client","src.features","src.data_penalties","src.labeler","src.learn","src.predict","src.reporter","src.injuries"]:
+              importlib.import_module(m)
+          print("imports ok")
+          PY
 
       - name: Apply tuned config if present + validate
         run: |
           set -e
           if [ -f tuning-results/best_config.yaml ]; then
+            echo "Using tuned config"
             cp tuning-results/best_config.yaml config.yaml
           fi
           python -m src.tools.validate_config
 
       # --------- Backfill penalties (staged 5-3-1) ----------
       - name: Backfill penalties (staged 5-3-1)
-        if: ${{ contains(fromJSON('["auto","learn","predict"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
+        if: ${{ contains(fromJSON('["auto","learn","predict"]'), inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
+          echo "== build penalties: 5 seasons strict =="
           python -m src.data_penalties --years 5 --windows 3,5,10 --strict
+          echo "== build penalties: 3 seasons strict =="
           python -m src.data_penalties --years 3 --windows 3,5,10 --strict
+          echo "== build penalties: 1 season strict =="
           python -m src.data_penalties --years 1 --windows 3,5,10 --strict
           ls -l artifacts/features || true
 
@@ -109,65 +109,18 @@ PY
           key: ${{ env.PENALTY_CACHE_SCOPE }}-${{ github.sha }}
 
       # --------- Predict ----------
-      - name: Predict (scores)
-        if: ${{ contains(fromJSON('["auto","predict"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
+      - name: Predict (scores + win prob)
+        if: ${{ contains(fromJSON('["auto","predict"]'), inputs.mode) || github.event_name == 'schedule' }}
         run: |
           set -e
-          ISO="${{ github.event.inputs.iso_week }}"
+          ISO="${{ inputs.iso_week }}"
           if [ -z "$ISO" ] || [ "$ISO" = "auto" ]; then
             ISO=$(python - <<'PY'
-import datetime
-d=datetime.date.today()
-iso=d.isocalendar()
-print(f"{iso.year}-{iso.week:02d}")
-PY
-)
+            import datetime as d
+            iso=d.date.today().isocalendar()
+            print(f"{iso.year}-{iso.week:02d}")
+            PY
+            )
           fi
           echo "Scoring ISO week: $ISO"
           python -m src.predict --iso-week "$ISO" --features artifacts/features/penalties.parquet --out artifacts/preds.parquet
-
-      # --------- Label ----------
-      - name: Label
-        if: ${{ contains(fromJSON('["auto","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
-        run: |
-          set -e
-          Y=$(date -u +%Y)
-          python -m src.labeler --year "$Y" --season-type regular
-
-      # --------- News (Beat writer enrichment, optional) ----------
-      - name: News enrichment (optional)
-        if: ${{ contains(fromJSON('["auto","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
-        run: |
-          set -e
-          test -f data/news_feed.csv || { mkdir -p data; echo "team,text" > data/news_feed.csv; }
-          python -m src.news --in data/news_feed.csv --out artifacts/features/news.parquet
-
-      # --------- Learn ----------
-      - name: Learn (strict, real data)
-        if: ${{ contains(fromJSON('["auto","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
-        run: |
-          set -e
-          test -f artifacts/features/penalties.parquet || { echo "missing penalties.parquet"; exit 1; }
-          test -f artifacts/labels.parquet || { echo "missing labels.parquet"; exit 1; }
-          python -m src.learn --features artifacts/features/penalties.parquet --labels artifacts/labels.parquet --out artifacts/model.joblib
-
-      # --------- Report ----------
-      - name: Report
-        if: ${{ contains(fromJSON('["auto","predict","learn"]'), github.event.inputs.mode) || github.event_name == 'schedule' }}
-        run: |
-          set -e
-          if [ -f artifacts/preds.parquet ]; then
-            python -m src.reporter --preds artifacts/preds.parquet --out artifacts/report.md
-          else
-            printf "# NCAAF Elite Agent\n\n- run id: %s\n" "$GITHUB_RUN_ID" > artifacts/report.md
-          fi
-
-      - name: Upload artifacts
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-artifacts
-          path: |
-            artifacts/**
-            tuning-results/**
-          if-no-files-found: ignore
