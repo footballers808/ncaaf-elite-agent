@@ -1,14 +1,27 @@
-season_type: regular
-form_games: 4
-pace_games: 5
+# config.yaml — baseline defaults the workflow can validate and use
 
-# injuries
+# What part of the season to pull from CFBD
+season_type: regular      # regular | postseason
+
+# Rolling-window feature settings
+form_games: 4             # recent form window (games)
+pace_games: 4             # recent pace window (games)
+
+# Injury model knobs
 injury_window_days: 28
 injury_spread_weight_per_point: 0.5
 injury_total_weight_per_point: 0.3
 max_spread_adj_component: 3.0
 max_total_adj_component: 3.0
 
-# weather
+# Weather enrichment (used in src/features.py)
 weather_enabled: true
 weather_hours_before: 3
+
+# Model used by learn/predict (simple & available in sklearn)
+model:
+  type: random_forest
+  random_state: 42
+  n_estimators: 400
+  max_depth: 12
+  min_samples_leaf: 2
