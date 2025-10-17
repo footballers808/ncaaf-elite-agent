@@ -1,124 +1,129 @@
-import os, requests, datetime as dt
-from collections import defaultdict
-from typing import Dict, Tuple, Any, List
+# src/injuries.py
+from __future__ import annotations
 
-CFBD = "https://api.collegefootballdata.com"
+import datetime as dt
+from typing import Dict, List, Tuple, Any
 
-def _headers():
-    key = os.environ.get("CFBD_API_KEY","")
-    return {"Authorization": f"Bearer {key}"} if key else {}
+import numpy as np
+import pandas as pd
 
-def _get(url, params):
-    r = requests.get(url, params=params, headers=_headers(), timeout=45)
-    if r.status_code != 200:
-        return []  # fail-soft
-    return r.json()
+from .cfbd_client import injuries as cfbd_injuries  # unified CFBD client
 
-# Weight by position → how much a confirmed OUT shifts team strength
-# QB is most impactful; OL/DL matter as a group (we aggregate)
-POS_WEIGHT = {
-    "QB": 2.5,
-    "RB": 0.6, "WR": 0.6, "TE": 0.4,
-    "OL": 0.5, "C": 0.5, "G": 0.5, "T": 0.5,
-    "DL": 0.5, "DE": 0.5, "DT": 0.5, "NT": 0.5,
-    "LB": 0.5, "DB": 0.5, "CB": 0.5, "S": 0.5, "FS": 0.5, "SS": 0.5, "NB": 0.4,
-    # fallback
-    "DEF": 0.5, "OFF": 0.5, "ST": 0.3
-}
 
-NEG_STATUSES = {"Out","Doubtful","Inactive"}  # Questionable = lighter
-QUESTIONABLE_FACTOR = 0.5
+# ---- knobs (can be overridden by config.yaml via callers) ----
+# statuses we treat as negative / soft-negative
+NEG_STATUSES = {"Out", "Doubtful"}
+QUESTIONABLE_STATUSES = {"Questionable"}
+
 
 def _pos_weight(pos: str) -> float:
+    """
+    Lightweight positional weights. QB hits harder; core positions medium; rest light.
+    """
     pos = (pos or "").upper()
-    return POS_WEIGHT.get(pos, 0.3)
+    if pos in {"QB"}:
+        return 1.0
+    if pos in {"WR", "RB", "LT", "RT", "CB", "S", "EDGE", "DL", "LB"}:
+        return 0.6
+    return 0.4
 
-def _decay(days: int, half_life_days: int) -> float:
-    # simple exponential-ish decay (recent news counts more)
-    return max(0.0, 0.5 ** max(0, days) / max(0.5 ** half_life_days, 1e-6))
 
-def team_injury_scores(year: int, team: str, today: dt.date, decay_days: int=28) -> Tuple[float, List[str]]:
+def _decay(days_ago: int, half_life_days: int = 10) -> float:
     """
-    Returns (score, notes). Higher score = more negative impact on the team.
+    Half-life decay so recent news counts more.
     """
-    js = _get(f"{CFBD}/injuries", {"year": year, "team": team})
-    if not isinstance(js, list): 
-        return 0.0, []
+    if days_ago < 0:
+        days_ago = 0
+    # avoid divide-by-tiny when half_life_days is small
+    denom = max(0.5**max(half_life_days, 1), 1e-6)
+    return max(0.0, (0.5**days_ago) / denom)
+
+
+def team_injury_scores(
+    year: int,
+    team: str,
+    today: dt.date,
+    decay_days: int = 28,
+) -> Tuple[float, List[str]]:
+    """
+    Returns (score, notes). Higher score => more negative impact on the team.
+    We collapse the CFBD payload to the given team and apply status/position/recency weights.
+    """
+    js: Any = cfbd_injuries(year=year, week=None) or []
+
+    # CFBD sometimes returns a list[{team, injuries: [...]}, ...]
+    if isinstance(js, list) and js and isinstance(js[0], dict) and "team" in js[0] and "injuries" in js[0]:
+        for entry in js:
+            if str(entry.get("team")) == team:
+                js = entry.get("injuries") or []
+                break
 
     score = 0.0
-    notes = []
-    for e in js:
+    notes: List[str] = []
+
+    for e in js if isinstance(js, list) else []:
         try:
             status = (e.get("status") or "").title()
-            pos = e.get("position") or ""
+            pos = (e.get("position") or "").upper()
             name = e.get("athlete") or e.get("player") or ""
+
             date_str = e.get("updated") or e.get("startDate") or e.get("start_date")
-            d = None
-            if date_str:
-                try:
-                    d = dt.date.fromisoformat(date_str[:10])
-                except:
-                    d = None
+            d = dt.date.fromisoformat(date_str[:10]) if date_str else None
             days_ago = (today - d).days if (d and today) else 0
-            w = _pos_weight(pos)
+
+            # clip decay horizon (past this, basically irrelevant)
+            days_ago = min(days_ago, max(decay_days, 1))
+
+            w = _pos_weight(pos) * _decay(days_ago, half_life_days=max(decay_days // 3, 5))
 
             if status in NEG_STATUSES:
-                s = w
-            elif status == "Questionable":
-                s = w * QUESTIONABLE_FACTOR
-            else:
-                s = 0.0
+                score += 1.0 * w
+            elif status in QUESTIONABLE_STATUSES:
+                score += 0.5 * w
 
-            # decay older items
-            mult = _decay(days_ago, decay_days)
-            s *= mult
-
-            score += s
-            if s > 0.0 and len(notes) < 6:
+            if w > 0 and len(notes) < 6 and (status in NEG_STATUSES or status in QUESTIONABLE_STATUSES):
                 notes.append(f"{name} {pos} {status}")
         except Exception:
+            # be robust to any missing/odd fields
             continue
 
     return float(score), notes
 
-def build_injury_map(slate, year: int, decay_days: int=28) -> Dict[str, Dict[str, Any]]:
+
+def build_injury_map(
+    slate: List[Dict[str, Any]],
+    year: int,
+    int_decay_days: int = 28,
+) -> Dict[str, Dict[str, Any]]:
     """
-    Returns {team: {'score': float, 'notes': [..]}}
+    Build {team: {'score': float, 'notes': [..]}} for all teams in the slate (games).
     """
     today = dt.date.today()
-    teams = set()
+    teams: set[str] = set()
     for g in slate:
-        teams.add(g.get("homeTeam")); teams.add(g.get("awayTeam"))
+        teams.add(str(g.get("homeTeam")))
+        teams.add(str(g.get("awayTeam")))
 
-    out = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for t in teams:
-        s, notes = team_injury_scores(year, t, today, decay_days)
+        s, notes = team_injury_scores(year, t, today, int_decay_days)
         out[t] = {"score": s, "notes": notes}
     return out
 
-def injury_adjustments(game, inj_map, cfg) -> Tuple[float,float,str]:
+
+def injury_adjustments(
+    game: Dict[str, Any],
+    inj_map: Dict[str, Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Tuple[float, float, str]:
     """
     Convert team injury scores into (spread_adj, total_adj, note).
+
     Positive spread_adj favors HOME; negative favors AWAY.
+    Positive total_adj reduces expected scoring slightly (more injuries => lower total).
     """
-    home = game["homeTeam"]; away = game["awayTeam"]
-    s_h = inj_map.get(home,{}).get("score",0.0)
-    s_a = inj_map.get(away,{}).get("score",0.0)
+    home = str(game["homeTeam"])
+    away = str(game["awayTeam"])
 
-    # If home has more injury burden → move spread TOWARD away
-    # so spread_adj = -(home_minus_away)*weight
-    diff = s_h - s_a
-    spread_adj = -diff * cfg["injury_spread_weight_per_point"]
-    spread_adj = float(max(-cfg["max_spread_adj_component"], min(spread_adj, cfg["max_spread_adj_component"])))
-
-    # Total: more injuries (esp. on offense) often reduce scoring slightly
-    # Use combined burden with mild scale
-    total_adj = -(s_h + s_a) * cfg["injury_total_weight_per_point"]
-    total_adj = float(max(-cfg["max_total_adj_component"], min(total_adj, cfg["max_total_adj_component"])))
-
-    note_bits = []
-    if inj_map.get(home,{}).get("notes"): note_bits.append(f"H: {', '.join(inj_map[home]['notes'][:3])}")
-    if inj_map.get(away,{}).get("notes"): note_bits.append(f"A: {', '.join(inj_map[away]['notes'][:3])}")
-    note = " | ".join(note_bits)
-
-    return spread_adj, total_adj, note
+    s_h = float(inj_map.get(home, {}).get("score", 0.0))
+    s_a = float(in_
